@@ -3,18 +3,19 @@
 # Multi-stage build:
 #   stage 1 (deps)    — install Python packages into a clean venv
 #   stage 2 (runtime) — copy the venv + app code; install Playwright browsers
+#
+# Fix: Playwright browsers are installed to /ms-playwright (world-readable)
+#      so they work whether running as root or as appuser.
 # ---------------------------------------------------------------------------
 
 FROM python:3.11-slim AS deps
 
 WORKDIR /app
 
-# Install system build deps needed by some packages (e.g. msgpack)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies into a virtual-env to keep the image lean
 COPY requirements.txt .
 RUN python -m venv /opt/venv \
     && /opt/venv/bin/pip install --upgrade pip \
@@ -23,9 +24,8 @@ RUN python -m venv /opt/venv \
 # ---------------------------------------------------------------------------
 FROM python:3.11-slim AS runtime
 
-# Playwright needs these system libs for Chromium
+# Chromium system runtime deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    # Chromium runtime deps
     libglib2.0-0 \
     libnss3 \
     libatk1.0-0 \
@@ -51,22 +51,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     wget \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy the virtualenv from the deps stage
 COPY --from=deps /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-# Install Playwright Chromium browser (runs inside the venv)
-RUN playwright install chromium
+# ── Key fix: install browsers to a world-readable location ────────────────
+# Without this, browsers go to /root/.cache and are invisible to appuser.
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+RUN playwright install chromium \
+    && chmod -R o+rx /ms-playwright
 
 WORKDIR /app
-
-# Copy application source
 COPY . .
 
-# Render exposes port 10000 by default
 EXPOSE 10000
 
-# Tighten: run as non-root
 RUN useradd --create-home appuser
 USER appuser
 
