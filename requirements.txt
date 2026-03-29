@@ -1,0 +1,7 @@
+playwright==1.44.0
+fastapi
+uvicorn[standard]
+httpx
+aiocache[msgpack]
+apscheduler
+python-dotenv

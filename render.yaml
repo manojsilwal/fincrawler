@@ -1,0 +1,24 @@
+# render.yaml
+# FinCrawler — Render Infrastructure Definition
+# Deploy: push this file to your GitHub repo and connect to Render.
+# Render will auto-detect render.yaml and provision the service.
+
+services:
+  - type: web
+    name: fincrawler
+    runtime: docker          # Use our Dockerfile — gives us Playwright + Chromium
+    plan: starter            # Upgrade to "standard" for more RAM if needed
+    region: oregon           # Change to match your finance-agent app's region
+    branch: main
+
+    # Health check — Render routes traffic only after this passes
+    healthCheckPath: /health
+
+    # Environment variables — set secret values in the Render dashboard
+    envVars:
+      - key: API_KEY
+        sync: false          # Set this in Render dashboard → keep it secret!
+      - key: PYTHON_ENV
+        value: production
+      - key: LOG_LEVEL
+        value: INFO
