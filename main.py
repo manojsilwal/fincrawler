@@ -90,6 +90,9 @@ app.add_middleware(
 # Routes
 # ---------------------------------------------------------------------------
 
+from firecrawl_compat import router as firecrawl_router
+app.include_router(firecrawl_router)
+
 @app.get("/health", tags=["Infra"])
 async def health():
     """Liveness probe — no auth required."""
