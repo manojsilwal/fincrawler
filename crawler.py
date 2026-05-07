@@ -19,9 +19,11 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-_NAV_TIMEOUT_MS = 30_000   # 30 s page-load hard limit
-_SCROLL_DELAY_MS = 800     # wait after scroll to trigger lazy-load
-_MAX_TEXT_CHARS = 50_000   # truncate extracted text to keep responses lean
+_NAV_TIMEOUT_MS  = 30_000   # 30 s page-load hard limit
+_SCROLL_DELAY_MS = 800      # wait after scroll to trigger lazy-load
+# Raised from 50 K → 200 K: the extractor pipeline handles chunking/retrieval;
+# raw crawl should preserve as much content as possible for long docs (SEC 10-K).
+_MAX_TEXT_CHARS  = 200_000
 
 
 # ---------------------------------------------------------------------------
@@ -29,10 +31,22 @@ _MAX_TEXT_CHARS = 50_000   # truncate extracted text to keep responses lean
 # ---------------------------------------------------------------------------
 
 def _clean_text(raw: str) -> str:
-    """Strip excess whitespace / blank lines from extracted page text."""
-    lines = (line.strip() for line in raw.splitlines())
-    non_empty = (line for line in lines if line)
-    return "\n".join(non_empty)[:_MAX_TEXT_CHARS]
+    """Strip excess whitespace / blank lines from extracted page text.
+
+    Collapses duplicate blank lines but preserves paragraph structure so that
+    downstream chunking in extractor.py can split on double-newlines correctly.
+    """
+    lines = [line.strip() for line in raw.splitlines()]
+    # Collapse runs of empty lines into a single blank line (paragraph boundary)
+    deduped: list[str] = []
+    prev_blank = False
+    for line in lines:
+        is_blank = (line == "")
+        if is_blank and prev_blank:
+            continue
+        deduped.append(line)
+        prev_blank = is_blank
+    return "\n".join(deduped)[:_MAX_TEXT_CHARS]
 
 
 async def _scroll_to_bottom(page: Page):
@@ -94,12 +108,14 @@ async def crawl_single(url: str) -> dict:
             raw_text = await page.inner_text("body")
             text = _clean_text(raw_text)
 
-            logger.info("Crawled %s — %d chars", url, len(text))
+            char_count = len(text)
+            logger.info("Crawled %s — %d chars (%d chunks est.)", url, char_count, max(1, char_count // 12_000))
             return {
                 "url": url,
                 "title": title,
                 "text": text,
                 "http_status": http_status,
+                "char_count": char_count,
                 "status": "ok",
                 "cache_hit": False,
                 "crawled_at": crawled_at,

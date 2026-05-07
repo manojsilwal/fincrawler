@@ -4,9 +4,11 @@ FinCrawler — FastAPI web service entry point.
 
 Endpoints
 ---------
-GET  /health        Liveness probe (Render health check)
-GET  /quote         Yahoo Finance quote scrape → spot price (API-key protected when configured)
-POST /scrape        Cache-first URL scrape (API-key protected)
+GET  /health        Liveness + LLM connectivity probe
+GET  /quote         Yahoo Finance quote (regex fast-path, then LLM fallback)
+GET  /quote/smart   LLM-powered structured quote extraction via DeepSeek v4 Pro
+POST /scrape        Cache-first URL scrape → raw text (API-key protected)
+POST /extract       Crawl + chunk + LLM extract → structured JSON (API-key protected)
 DELETE /cache       Clear all cached entries (API-key protected)
 """
 
@@ -14,17 +16,20 @@ import logging
 import os
 import re
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Any, Optional
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, HttpUrl
 
 from browser_pool import pool
 from cache import cache
 from crawler import crawl_single
+from extractor import extract_from_page, extract_quote
 from prefetch import start_scheduler
+from shop_crawler import search_product, RETAILERS
 
 load_dotenv()
 
@@ -43,10 +48,10 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 _API_KEY = os.getenv("API_KEY", "")
 
+
 def _require_api_key(x_api_key: str = Header(default="")):
     """Dependency: reject requests whose X-Api-Key header doesn't match."""
     if not _API_KEY:
-        # No key configured → open access (useful for local dev, not recommended for prod)
         return
     if x_api_key != _API_KEY:
         raise HTTPException(
@@ -74,8 +79,145 @@ def _verify_bearer_or_x_api_key(
         )
 
 
+# ---------------------------------------------------------------------------
+# Pydantic response models
+# ---------------------------------------------------------------------------
+
+class HealthResponse(BaseModel):
+    status: str
+    service: str
+    llm_online: bool
+
+
+class QuoteResponse(BaseModel):
+    ok: bool
+    ticker: str
+    price: Optional[float] = None
+    currency: str = "USD"
+    source: str = "yahoo"
+    error: Optional[str] = None
+
+
+class SmartQuoteData(BaseModel):
+    regularMarketPrice: Optional[float] = None
+    regularMarketChangePercent: Optional[float] = None
+    regularMarketVolume: Optional[int] = None
+    fiftyTwoWeekHigh: Optional[float] = None
+    fiftyTwoWeekLow: Optional[float] = None
+    trailingPE: Optional[float] = None
+    marketCap: Optional[float] = None
+    shortName: Optional[str] = None
+
+
+class SmartQuoteResponse(BaseModel):
+    ok: bool
+    ticker: str
+    data: Optional[SmartQuoteData] = None
+    cache_hit: bool = False
+    chunks_used: int = 0
+    total_chunks: int = 0
+    error: Optional[str] = None
+
+
+class ScrapeResponse(BaseModel):
+    url: str
+    title: Optional[str] = None
+    text: Optional[str] = None
+    char_count: Optional[int] = None
+    http_status: Optional[int] = None
+    status: str
+    cache_hit: bool = False
+    crawled_at: Optional[str] = None
+    error: Optional[str] = None
+
+
+class ExtractRequest(BaseModel):
+    url: str = Field(..., description="Target URL to scrape and extract from")
+    prompt: str = Field(
+        ...,
+        description=(
+            "Natural language instruction, e.g. "
+            "'Extract current stock price, P/E ratio, and 52-week range'"
+        ),
+    )
+    extra_context: Optional[str] = Field(
+        None,
+        description="Optional extra context injected into the LLM system prompt (e.g. ticker symbol)",
+    )
+    force_refresh: bool = Field(False, description="Bypass cache and re-crawl + re-extract")
+
+
+class ExtractResponse(BaseModel):
+    url: str
+    prompt: str
+    data: dict[str, Any]
+    cache_hit: bool
+    chunks_used: int
+    total_chunks: int
+    status: str
+    validation_error: Optional[str] = None
+    error: Optional[str] = None
+
+
+class ShopSearchRequest(BaseModel):
+    query: str = Field(..., description="Product name to search, e.g. 'DJI Osmo Pocket 3'")
+    retailers: Optional[list[str]] = Field(
+        None,
+        description="Subset of: amazon, walmart, ebay, bestbuy, target. Omit for all.",
+    )
+    max_concurrency: int = Field(3, ge=1, le=5, description="Parallel browser contexts (1-5)")
+    google_fallback: bool = Field(
+        True,
+        description=(
+            "Run Google Shopping in parallel and use it to fill in prices "
+            "for any retailer that blocks the direct crawl."
+        ),
+    )
+
+
+class ShopResultData(BaseModel):
+    product_name: Optional[str] = None
+    price: Optional[float] = None
+    original_price: Optional[float] = None
+    discount_pct: Optional[float] = None
+    currency: str = "USD"
+    availability: Optional[str] = None
+    seller: Optional[str] = None
+    rating: Optional[float] = None
+    review_count: Optional[int] = None
+    product_url: Optional[str] = None
+    savings: Optional[float] = None
+
+
+class ShopRetailerResult(BaseModel):
+    retailer: str
+    retailer_key: str
+    query: str
+    url: str
+    status: str
+    data: Optional[dict[str, Any]] = None
+    llm_extraction: bool = False
+    char_count: Optional[int] = None
+    http_status: Optional[int] = None
+    block_reason: Optional[str] = None
+    error: Optional[str] = None
+    crawled_at: Optional[str] = None
+
+
+class ShopSearchResponse(BaseModel):
+    query: str
+    retailers_attempted: int
+    retailers_success: int
+    retailers_blocked: int
+    results: list[dict[str, Any]]
+
+
+# ---------------------------------------------------------------------------
+# Legacy regex-based Yahoo price extraction (kept as fast-path fallback)
+# ---------------------------------------------------------------------------
+
 def _parse_yahoo_regular_price(page_text: str) -> Optional[float]:
-    """Best-effort extract last trade from Yahoo quote HTML / embedded JSON (incl. script tags)."""
+    """Best-effort extract last trade from Yahoo quote embedded JSON."""
     if not page_text:
         return None
     patterns = (
@@ -98,7 +240,7 @@ def _parse_yahoo_regular_price(page_text: str) -> Optional[float]:
 
 async def _fetch_yahoo_quote_price(url: str) -> tuple[Optional[float], Optional[str]]:
     """
-    Load Yahoo quote URL; parse embedded JSON in HTML and/or visible streamer nodes.
+    Load Yahoo quote URL; parse embedded JSON and/or fin-streamer DOM nodes.
     Returns (price, error_message).
     """
     from browser_pool import pool
@@ -111,7 +253,6 @@ async def _fetch_yahoo_quote_price(url: str) -> tuple[Optional[float], Optional[
             price = _parse_yahoo_regular_price(html)
             if price is not None:
                 return price, None
-            # Yahoo often renders price in fin-streamer (client-side); not always in static HTML.
             for sel in (
                 "[data-field='regularMarketPrice']",
                 "fin-streamer[data-field='regularMarketPrice']",
@@ -158,8 +299,11 @@ async def lifespan(app: FastAPI):
 # ---------------------------------------------------------------------------
 app = FastAPI(
     title="FinCrawler",
-    description="Async financial web-crawler microservice for the Finance Agent.",
-    version="1.0.0",
+    description=(
+        "Async financial web-crawler microservice with LLM-powered extraction "
+        "via DeepSeek v4 Pro (NVIDIA API). Serves the TradeTalk Finance Agent."
+    ),
+    version="2.0.0",
     lifespan=lifespan,
     docs_url="/docs",
     redoc_url="/redoc",
@@ -167,33 +311,59 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # tighten to your finance-agent Render URL in prod
+    allow_origins=["*"],   # tighten to finance-agent Render URL in prod
     allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["*"],
 )
 
 
 # ---------------------------------------------------------------------------
-# Routes
+# Routes — Firecrawl compat
 # ---------------------------------------------------------------------------
-
 from firecrawl_compat import router as firecrawl_router
 app.include_router(firecrawl_router)
 
-@app.get("/health", tags=["Infra"])
+
+# ---------------------------------------------------------------------------
+# Routes — Infra
+# ---------------------------------------------------------------------------
+
+@app.get("/health", tags=["Infra"], response_model=HealthResponse)
 async def health():
-    """Liveness probe — no auth required."""
-    return {"status": "ok", "service": "fincrawler"}
+    """
+    Liveness probe — no auth required.
+    Also checks LLM endpoint reachability (non-blocking: returns llm_online=false on timeout).
+    """
+    llm_ok = False
+    try:
+        from llm import llm_health_check
+        llm_ok = await llm_health_check()
+    except Exception:
+        pass
+    return HealthResponse(status="ok", service="fincrawler", llm_online=llm_ok)
 
 
-@app.get("/quote", tags=["Crawler"])
+@app.delete("/cache", tags=["Infra"])
+async def clear_cache(x_api_key: str = Header(default="")):
+    """Evict all cached entries (raw scrapes + LLM extractions)."""
+    _require_api_key(x_api_key)
+    await cache.clear_all()
+    return {"status": "cache cleared"}
+
+
+# ---------------------------------------------------------------------------
+# Routes — Crawler (raw)
+# ---------------------------------------------------------------------------
+
+@app.get("/quote", tags=["Crawler"], response_model=QuoteResponse)
 async def quote_yahoo(
     ticker: str,
     _: None = Depends(_verify_bearer_or_x_api_key),
 ):
     """
-    Return regular-market spot for a US ticker by scraping Yahoo quote HTML.
-    Used when upstream yfinance from another datacenter returns empty history.
+    Regex fast-path: scrape Yahoo Finance quote HTML and parse the embedded
+    ``regularMarketPrice`` JSON field.  No LLM call — use ``/quote/smart``
+    for richer structured data.
     """
     sym = (ticker or "").upper().strip()
     if not sym:
@@ -204,29 +374,65 @@ async def quote_yahoo(
     if err:
         raise HTTPException(status_code=502, detail=err)
     if price is None:
-        return JSONResponse(
-            content={
-                "ok": False,
-                "ticker": sym,
-                "error": "price_not_found",
-            },
-            status_code=422,
-        )
-    return {"ok": True, "ticker": sym, "price": round(price, 4), "currency": "USD"}
+        return QuoteResponse(ok=False, ticker=sym, error="price_not_found")
+    return QuoteResponse(ok=True, ticker=sym, price=round(price, 4))
 
 
-@app.post("/scrape", tags=["Crawler"])
+@app.get("/quote/smart", tags=["Crawler"], response_model=SmartQuoteResponse)
+async def quote_smart(
+    ticker: str,
+    force_refresh: bool = False,
+    _: None = Depends(_verify_bearer_or_x_api_key),
+):
+    """
+    **LLM-powered quote extraction** via DeepSeek v4 Pro.
+
+    Crawls Yahoo Finance, chunks the page, retrieves the most relevant
+    sections, and instructs the LLM to extract a full structured quote
+    (price, change %, volume, 52-week range, P/E, market cap, company name).
+
+    Results are cached by (url + prompt) for 5 minutes.
+    """
+    sym = (ticker or "").upper().strip()
+    if not sym:
+        raise HTTPException(status_code=400, detail="ticker is required")
+
+    result = await extract_quote(ticker=sym, force_refresh=force_refresh)
+
+    if result["status"] == "error":
+        raise HTTPException(status_code=502, detail=result.get("error", "extraction_failed"))
+
+    raw_data = result.get("data", {})
+    # Try to coerce to typed model; fall back gracefully
+    try:
+        quote_data = SmartQuoteData.model_validate(raw_data)
+    except Exception:
+        quote_data = None
+
+    return SmartQuoteResponse(
+        ok=True,
+        ticker=sym,
+        data=quote_data,
+        cache_hit=result.get("cache_hit", False),
+        chunks_used=result.get("chunks_used", 0),
+        total_chunks=result.get("total_chunks", 0),
+    )
+
+
+@app.post("/scrape", tags=["Crawler"], response_model=ScrapeResponse)
 async def scrape(
     url: str,
     force_refresh: bool = False,
     x_api_key: str = Header(default=""),
 ):
     """
-    Scrape *url* and return its text content.
+    Scrape *url* and return its raw text content.
 
     - Returns cached result if available (unless force_refresh=true).
     - Caches successful results with domain-aware TTL.
     - Requires **X-Api-Key** header in production.
+
+    Use ``POST /extract`` if you need structured data extracted by the LLM.
     """
     _require_api_key(x_api_key)
 
@@ -251,12 +457,156 @@ async def scrape(
     )
 
 
-@app.delete("/cache", tags=["Infra"])
-async def clear_cache(x_api_key: str = Header(default="")):
+# ---------------------------------------------------------------------------
+# Routes — LLM Extraction (new)
+# ---------------------------------------------------------------------------
+
+@app.post("/extract", tags=["LLM Extraction"], response_model=ExtractResponse)
+async def extract(
+    req: ExtractRequest,
+    x_api_key: str = Header(default=""),
+):
     """
-    Evict all cached entries.
-    Useful during development or to force a full re-crawl of S&P 500 data.
+    **Intelligent extraction endpoint** — the flagship feature of FinCrawler v2.
+
+    Pipeline:
+    1. `crawl_single(url)` — Playwright browser fetch
+    2. `chunk_text(text)` — token-aware paragraph splitting (≈3K tokens / chunk)
+    3. `select_top_chunks(chunks, prompt)` — keyword-relevance retrieval (top 4)
+    4. `extract_structured(context, prompt)` — DeepSeek v4 Pro → JSON
+    5. Return typed, cached result
+
+    **Use cases:**
+    - `"Extract current price, P/E ratio, and 52-week range"` → stock page
+    - `"List all earnings dates and EPS estimates"` → earnings calendar
+    - `"Extract the company's revenue, net income, and EPS for the last 4 quarters"` → SEC filing
+    - `"Summarise the key risk factors"` → 10-K
+
+    Results cached by `hash(url + prompt)` with domain-aware TTL.
     """
     _require_api_key(x_api_key)
-    await cache.clear_all()
-    return {"status": "cache cleared"}
+
+    if not req.url:
+        raise HTTPException(status_code=400, detail="url is required")
+    if not req.prompt:
+        raise HTTPException(status_code=400, detail="prompt is required")
+
+    result = await extract_from_page(
+        url=req.url,
+        prompt=req.prompt,
+        force_refresh=req.force_refresh,
+        extra_context=req.extra_context,
+    )
+
+    http_status = 200
+    if result.get("status") == "error":
+        http_status = 502
+
+    return JSONResponse(content=result, status_code=http_status)
+
+
+# ---------------------------------------------------------------------------
+# Routes — Shopping (new)
+# ---------------------------------------------------------------------------
+
+@app.post("/shop/search", tags=["Shopping"], response_model=ShopSearchResponse)
+async def shop_search(
+    req: ShopSearchRequest,
+    x_api_key: str = Header(default=""),
+):
+    """
+    **Multi-retailer product price comparison** with stealth crawling + LLM extraction.
+
+    Fans out to up to 5 major retailers in parallel using:
+    - Anti-bot stealth browser (7 JS patches, randomised UA/viewport)
+    - Human-like scrolling & timing delays
+    - Cloudflare/challenge page detection & wait
+    - Cookie consent auto-dismiss
+    - DeepSeek v4 Pro LLM → structured product data
+
+    Example request body:
+    ```json
+    {
+      "query": "DJI Osmo Pocket 3",
+      "retailers": ["amazon", "walmart", "ebay", "bestbuy", "target"]
+    }
+    ```
+
+    Supported retailer keys: **amazon, walmart, ebay, bestbuy, target**
+
+    Each result contains:
+    - `status`: ok | blocked | error
+    - `data.product_name`, `data.price`, `data.original_price`, `data.discount_pct`
+    - `data.availability`, `data.rating`, `data.review_count`, `data.product_url`
+    - `block_reason` if the retailer blocked the request
+    """
+    _require_api_key(x_api_key)
+
+    if not req.query or not req.query.strip():
+        raise HTTPException(status_code=400, detail="query is required")
+
+    # Validate retailer keys
+    valid_keys = set(RETAILERS.keys())
+    unknown = [r for r in (req.retailers or []) if r not in valid_keys]
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown retailer(s): {unknown}. Valid: {sorted(valid_keys)}",
+        )
+
+    results = await search_product(
+        query=req.query.strip(),
+        retailers=req.retailers,
+        max_concurrency=req.max_concurrency,
+        google_fallback=req.google_fallback,
+    )
+
+    ok_count      = sum(1 for r in results if r.get("status") in ("ok", "ok_via_google"))
+    blocked_count = sum(1 for r in results if r.get("status") == "blocked")
+
+    return ShopSearchResponse(
+        query=req.query,
+        retailers_attempted=len(results),
+        retailers_success=ok_count,
+        retailers_blocked=blocked_count,
+        results=results,
+    )
+
+
+@app.post("/shop/google", tags=["Shopping"])
+async def shop_google(
+    query: str,
+    x_api_key: str = Header(default=""),
+):
+    """
+    **Direct Google Shopping search** — single request, data from all retailers.
+
+    Crawls `https://www.google.com/search?q={query}&tbm=shop` with full stealth,
+    then uses DeepSeek v4 Pro to extract every product listing on the page.
+
+    Returns a unified list of price offers across Amazon, Walmart, eBay,
+    Best Buy, Target and any other retailers Google shows — in one call.
+
+    Much faster than `/shop/search` when you only need prices and don't need
+    to navigate individual product pages.
+    """
+    _require_api_key(x_api_key)
+    if not query or not query.strip():
+        raise HTTPException(status_code=400, detail="query is required")
+
+    from google_shop import google_shop_search
+    result = await google_shop_search(query=query.strip())
+
+    status_code = 200 if result.get("status") == "ok" else 502
+    return JSONResponse(content=result, status_code=status_code)
+
+
+@app.get("/shop/retailers", tags=["Shopping"])
+async def shop_retailers():
+    """List all supported retailer keys and their names."""
+    return {
+        "retailers": [
+            {"key": k, "name": v["name"], "search_url_template": v["search_url"]}
+            for k, v in RETAILERS.items()
+        ]
+    }

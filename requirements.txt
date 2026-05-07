@@ -5,3 +5,4 @@ httpx
 aiocache[msgpack]
 apscheduler
 python-dotenv
+openai>=1.30.0
