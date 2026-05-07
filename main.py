@@ -212,6 +212,33 @@ class ShopSearchResponse(BaseModel):
     results: list[dict[str, Any]]
 
 
+class CardRecommendationRequest(BaseModel):
+    category: str = Field(..., description="Category for card recommendation, e.g. 'dining', 'travel', 'groceries'")
+
+class CardRecommendationResponse(BaseModel):
+    status: str
+    category: str
+    url: Optional[str] = None
+    cards: list[dict[str, Any]]
+    total_cards: int
+    crawled_at: Optional[str] = None
+    error: Optional[str] = None
+
+class PointsUsageRequest(BaseModel):
+    points_program: str = Field(..., description="Points program, e.g. 'Chase Ultimate Rewards', 'Amex Membership Rewards'")
+    spend_category: str = Field(..., description="Category to spend on, e.g. 'flights to Europe', 'luxury hotels'")
+
+class PointsUsageResponse(BaseModel):
+    status: str
+    points_program: str
+    spend_category: str
+    url: Optional[str] = None
+    strategies: list[dict[str, Any]]
+    total_strategies: int
+    crawled_at: Optional[str] = None
+    error: Optional[str] = None
+
+
 # ---------------------------------------------------------------------------
 # Legacy regex-based Yahoo price extraction (kept as fast-path fallback)
 # ---------------------------------------------------------------------------
@@ -610,3 +637,46 @@ async def shop_retailers():
             for k, v in RETAILERS.items()
         ]
     }
+
+
+# ---------------------------------------------------------------------------
+# Routes — Cards & Points (new)
+# ---------------------------------------------------------------------------
+
+@app.post("/cards/recommend", tags=["Cards"], response_model=CardRecommendationResponse)
+async def cards_recommend(
+    req: CardRecommendationRequest,
+    x_api_key: str = Header(default=""),
+):
+    """
+    Search and recommend best credit cards for a specific category.
+    """
+    _require_api_key(x_api_key)
+    if not req.category or not req.category.strip():
+        raise HTTPException(status_code=400, detail="category is required")
+
+    from cards_crawler import search_card_recommendations
+    result = await search_card_recommendations(req.category.strip())
+    
+    status_code = 200 if result.get("status") == "ok" else 502
+    return JSONResponse(content=result, status_code=status_code)
+
+@app.post("/cards/points-usage", tags=["Cards"], response_model=PointsUsageResponse)
+async def points_usage(
+    req: PointsUsageRequest,
+    x_api_key: str = Header(default=""),
+):
+    """
+    Search and find the best usage strategies for a points program on a specific spend category.
+    """
+    _require_api_key(x_api_key)
+    if not req.points_program or not req.points_program.strip():
+        raise HTTPException(status_code=400, detail="points_program is required")
+    if not req.spend_category or not req.spend_category.strip():
+        raise HTTPException(status_code=400, detail="spend_category is required")
+
+    from cards_crawler import search_points_usage
+    result = await search_points_usage(req.points_program.strip(), req.spend_category.strip())
+
+    status_code = 200 if result.get("status") == "ok" else 502
+    return JSONResponse(content=result, status_code=status_code)

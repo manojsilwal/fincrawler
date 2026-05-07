@@ -1,0 +1,27 @@
+# FinCrawler on GCP
+# Deploy: docker compose -f docker-compose.gcp.yml up -d --build
+
+services:
+  fincrawler:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "10000:10000"
+    env_file: .env.gcp
+    environment:
+      # Port matches EXPOSE inside Dockerfile
+      PORT: "10000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:10000/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 40s
+      retries: 3
+    # Optional caching volume if we decide to mount any files persistently
+    volumes:
+      - fincrawler-data:/app/data
+
+volumes:
+  fincrawler-data:
