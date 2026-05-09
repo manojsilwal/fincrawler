@@ -111,20 +111,16 @@ async def extract_structured(
         f"Page content:\n{page_text}"
     )
 
-    logger.info("LLM extract | model=%s prompt_chars=%d", model, len(user_content))
-    
     max_retries = 3
     base_delay = 4
 
     for attempt in range(max_retries):
         current_model = model
-        is_fallback = False
-        
-        # On the last attempt, if we've been rate limited before, try the flash model
-        if attempt == max_retries - 1 and _FALLBACK_MODEL:
+        # Use fallback on 2nd and 3rd attempt if we get rate limited
+        if attempt > 0 and _FALLBACK_MODEL:
             current_model = _FALLBACK_MODEL
-            is_fallback = True
-            logger.info(f"Switching to fallback model: {current_model}")
+
+        logger.info("LLM extract | model=%s attempt=%d/%d prompt_chars=%d", current_model, attempt + 1, max_retries, len(user_content))
 
         try:
             async with _llm_semaphore:
@@ -146,29 +142,9 @@ async def extract_structured(
         except RateLimitError as exc:
             if attempt < max_retries - 1:
                 delay = base_delay * (2 ** attempt)
-                logger.warning(f"LLM {current_model} rate limited, retrying in {delay}s (attempt {attempt + 1}/{max_retries})")
+                logger.warning(f"LLM %s rate limited, retrying in %ds (attempt %d/%d)", current_model, delay, attempt + 1, max_retries)
                 await asyncio.sleep(delay)
             else:
-                if not is_fallback and _FALLBACK_MODEL:
-                    logger.warning(f"Main model {model} rate limited. Trying fallback {_FALLBACK_MODEL} immediately.")
-                    try:
-                        async with _llm_semaphore:
-                            response = await client.chat.completions.create(
-                                model=_FALLBACK_MODEL,
-                                messages=[
-                                    {"role": "system", "content": system_content},
-                                    {"role": "user", "content": user_content},
-                                ],
-                                temperature=_TEMPERATURE,
-                                max_tokens=_MAX_TOKENS,
-                                stream=False,
-                            )
-                        raw = response.choices[0].message.content or ""
-                        return _parse_json_response(raw)
-                    except Exception as fallback_exc:
-                        logger.exception(f"Fallback model {_FALLBACK_MODEL} also failed")
-                        return {"_error": str(fallback_exc), "_llm_raw": None}
-                
                 logger.exception("LLM extraction failed after max retries (Rate Limit)")
                 return {"_error": str(exc), "_llm_raw": None}
         except Exception as exc:  # noqa: BLE001
