@@ -45,7 +45,7 @@ def _get_client() -> AsyncOpenAI:
 # Constants
 # ---------------------------------------------------------------------------
 _MODEL = os.getenv("LLM_MODEL", "deepseek-ai/deepseek-v4-pro")
-_FALLBACK_MODEL = os.getenv("LLM_FALLBACK_MODEL", "deepseek-v4-flash")
+_FALLBACK_MODEL = os.getenv("LLM_FALLBACK_MODEL", "deepseek-ai/deepseek-v4-flash")
 _MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "4096"))
 _TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.1"))  # low for factual extraction
 
