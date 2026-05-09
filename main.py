@@ -119,6 +119,12 @@ class SmartQuoteResponse(BaseModel):
     error: Optional[str] = None
 
 
+
+class ScrapeRequest(BaseModel):
+    url: str
+    force_refresh: bool = False
+    max_bytes: Optional[int] = None
+
 class ScrapeResponse(BaseModel):
     url: str
     title: Optional[str] = None
@@ -448,35 +454,34 @@ async def quote_smart(
 
 @app.post("/scrape", tags=["Crawler"], response_model=ScrapeResponse)
 async def scrape(
-    url: str,
+    req: Optional[ScrapeRequest] = None,
+    url: Optional[str] = None,
     force_refresh: bool = False,
     x_api_key: str = Header(default=""),
 ):
-    """
-    Scrape *url* and return its raw text content.
-
-    - Returns cached result if available (unless force_refresh=true).
-    - Caches successful results with domain-aware TTL.
-    - Requires **X-Api-Key** header in production.
-
-    Use ``POST /extract`` if you need structured data extracted by the LLM.
-    """
     _require_api_key(x_api_key)
-
-    if not url:
-        raise HTTPException(status_code=400, detail="url query parameter is required.")
+    
+    # Resolve parameters from body or query
+    target_url = url
+    refresh = force_refresh
+    if req:
+        target_url = req.url or target_url
+        refresh = req.force_refresh or refresh
+        
+    if not target_url:
+        raise HTTPException(status_code=400, detail="url is required.")
 
     # L1: cache check
     if not force_refresh:
-        cached = await cache.get(url)
+        cached = await cache.get(target_url)
         if cached:
             return JSONResponse(content=cached)
 
     # L2: live crawl
-    result = await crawl_single(url)
+    result = await crawl_single(target_url)
 
     if result["status"] == "ok":
-        await cache.set(url, result)
+        await cache.set(target_url, result)
 
     return JSONResponse(
         content=result,
