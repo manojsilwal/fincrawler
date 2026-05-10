@@ -25,7 +25,7 @@ class BrowserPool:
 
     Usage
     -----
-    pool = BrowserPool(size=3)
+    pool = BrowserPool(size=2)
     await pool.initialize()
 
     async with pool.acquire() as page:
@@ -81,4 +81,4 @@ class BrowserPool:
 
 
 # Module-level singleton — imported by main.py and crawler.py
-pool = BrowserPool(size=3)
+pool = BrowserPool(size=2)

@@ -336,7 +336,7 @@ async def _extract_shop_result(crawl: dict, query: str) -> dict:
 async def search_product(
     query: str,
     retailers: Optional[list[str]] = None,
-    max_concurrency: int = 3,
+    max_concurrency: int = 1,
     google_fallback: bool = True,
 ) -> list[dict]:
     """
