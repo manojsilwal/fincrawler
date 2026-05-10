@@ -39,8 +39,9 @@ STEALTH_LAUNCH_ARGS: dict = {
 
 _USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
 ]
 
 _VIEWPORTS = [
@@ -117,18 +118,31 @@ _STEALTH_JS = r"""
 
     // 6. WebGL: spoof real GPU strings
     try {
-        const getParam = WebGLRenderingContext.prototype.getParameter;
-        WebGLRenderingContext.prototype.getParameter = function(p) {
-            if (p === 37445) return 'Intel Inc.';
-            if (p === 37446) return 'Intel Iris OpenGL Engine';
-            return getParam.call(this, p);
-        };
+        const canvas = document.createElement('canvas');
+        const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+        if (gl) {
+            const debugInfo = gl.getExtension('WEBGL_debug_renderer_info');
+            if (debugInfo) {
+                const getParam = gl.getParameter.bind(gl);
+                gl.getParameter = function(p) {
+                    if (p === debugInfo.UNMASKED_VENDOR_WEBGL) return 'Intel Inc.';
+                    if (p === debugInfo.UNMASKED_RENDERER_WEBGL) return 'Intel Iris OpenGL Engine';
+                    return getParam(p);
+                };
+            }
+        }
     } catch(_) {}
 
     // 7. Platform / hardware
     try { Object.defineProperty(navigator, 'platform', { get: () => 'Win32', configurable: true }); } catch(_) {}
     try { Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 }); } catch(_) {}
     try { Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 }); } catch(_) {}
+    
+    // 8. Mask outerHeight/innerWidth to look like real window
+    try {
+        window.outerHeight = window.innerHeight + 100;
+        window.outerWidth = window.innerWidth;
+    } catch(_) {}
 })();
 """
 

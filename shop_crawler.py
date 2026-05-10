@@ -182,6 +182,14 @@ async def _crawl_retailer(retailer_key: str, query: str) -> dict:
             # Inject stealth JS before any navigation
             await apply_stealth(page)
 
+                        # Warm up for sensitive retailers
+            if retailer_key in ("walmart", "target", "bestbuy"):
+                logger.info("[%s] Warming up session...", retailer_key)
+                base_url = "https://www." + retailer_key + ".com"
+                await page.goto(base_url, wait_until="domcontentloaded", timeout=20_000)
+                await _human_delay(1000, 2000)
+                await _dismiss_consent(page, cfg.get("consent_selectors", []))
+
             logger.info("Shop crawl [%s] → %s", retailer_key, url)
 
             # Navigate with a generous timeout
