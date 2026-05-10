@@ -112,7 +112,7 @@ async def extract_structured(
     )
 
     max_retries = 3
-    base_delay = 4
+    base_delay = 8
 
     for attempt in range(max_retries):
         current_model = model
@@ -136,7 +136,7 @@ async def extract_structured(
                 )
 
             raw = response.choices[0].message.content or ""
-            logger.debug("LLM raw response: %s", raw[:500])
+            logger.info("LLM raw response: %s", raw[:500])
             return _parse_json_response(raw)
 
         except RateLimitError as exc:
