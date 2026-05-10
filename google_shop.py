@@ -48,29 +48,20 @@ _GOOGLE_SHOP_URL_ALT = "https://www.google.com/search?q={query}+buy+price&tbm=sh
 # ---------------------------------------------------------------------------
 # LLM prompt
 # ---------------------------------------------------------------------------
-_GOOGLE_SHOP_PROMPT = """\
-This is a Google Shopping search results page for "{query}".
+_GOOGLE_SHOP_PROMPT = """ This is a Google Shopping search results page for "{query}".
 Extract ALL product listings visible on the page.
-Return a JSON object with a single key "listings" containing an array.
-Each listing object must have these fields:
-  retailer       (str)          — store/seller name e.g. "Amazon", "Walmart"
-  product_name   (str)          — exact product title shown
-  price          (float)        — current selling price in USD (numbers only, no $)
-  original_price (float|null)   — original/crossed-out price if a discount is shown
-  discount_pct   (float|null)   — discount percentage if shown
-  currency       (str)          — always "USD"
-  availability   (str)          — "In Stock" | "Out of Stock" | "Limited" | "Unknown"
-  rating         (float|null)   — star rating if shown
-  review_count   (int|null)     — number of reviews if shown
-  condition      (str)          — "New" | "Used" | "Refurbished" | "Unknown"
-  product_url    (str|null)     — product link if extractable
+CRITICAL RULES:
+- ONLY include the actual product requested ("{query}").
+- EXCLUDE accessories, cases, protection plans, and unrelated items.
+- If a listing is for a "Case for {query}" or "Protection for {query}", IGNORE it.
+- Ensure the price extracted is for the device itself.
 
+Return a JSON object with a single key "listings" containing an array.
+...
 Rules:
-- Include EVERY listing you can find, not just the first one.
-- Use null for any field not visible on the page.
-- Do not invent prices — only extract explicitly shown dollar amounts.
-- Return only the JSON object, no markdown fences.\
-"""
+- Include EVERY valid product listing, not just the first one.
+- Use null for any field not visible.
+- Do not invent data."""
 
 # ---------------------------------------------------------------------------
 # Retailer name normalisation → canonical keys

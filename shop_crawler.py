@@ -72,17 +72,21 @@ RETAILERS: dict[str, dict] = {
 # LLM extraction prompt for shopping data
 # ---------------------------------------------------------------------------
 
-_SHOP_PROMPT_TEMPLATE = """\
-Extract shopping/product information for "{query}" from this retail search results page.
-Find the FIRST matching product and extract all available fields.
+_SHOP_PROMPT_TEMPLATE = """ Extract shopping/product information for "{query}" from this retail search results page.
+Find the MOST RELEVANT match for the actual device/item.
+CRITICAL RULES:
+- IGNORE accessories (cases, screen protectors, cables, straps, batteries).
+- IGNORE protection plans or extended warranties.
+- IGNORE "sponsored" results if they do not match the query exactly.
+- If the first result is an accessory, skip it and find the actual product.
+- If the device is not found, return an object with "_error": "product_not_found".
+
 Return a single JSON object with:
-  product_name (str), price (float, USD), original_price (float or null if no discount),
+  product_name (str), price (float, USD), original_price (float or null),
   discount_pct (float or null), currency (str, default "USD"),
-  availability (str: "In Stock" | "Out of Stock" | "Limited" | "Unknown"),
-  seller (str, the retailer name), rating (float or null), review_count (int or null),
+  availability (str), seller (str), rating (float or null), review_count (int or null),
   product_url (str or null), savings (float or null).
-Only return the JSON object. Use null for unavailable fields. Do not invent data.\
-"""
+Only return the JSON object."""
 
 # ---------------------------------------------------------------------------
 # Human-like helpers
@@ -298,6 +302,17 @@ async def _extract_shop_result(crawl: dict, query: str) -> dict:
         prompt=prompt,
         extra_context=f"Retailer: {crawl['retailer']}. Product search: {query}",
     )
+
+    # Basic name-matching validation to prevent accessory hallucination
+    if "_error" not in extracted and extracted.get("product_name"):
+        name = extracted["product_name"].lower()
+        q = query.lower()
+        # If the query words are not in the name, but price is suspiciously low
+        query_words = [w for w in q.split() if len(w) > 2]
+        matches = sum(1 for w in query_words if w in name)
+        if matches < len(query_words) / 2 and extracted.get("price", 0) < 50:
+             logger.warning("[%s] Extraction rejected: product name mismatch or suspiciously low price for %s", crawl['retailer_key'], query)
+             extracted = {"_error": "product_name_mismatch", "product_name": extracted["product_name"], "price": extracted["price"]}
 
     # Attach without the raw page_text blob (too large for response)
     result = {k: v for k, v in crawl.items() if k != "page_text"}
