@@ -19,6 +19,8 @@ from contextlib import asynccontextmanager
 from typing import Any, Optional
 
 from dotenv import load_dotenv
+load_dotenv()
+
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -30,8 +32,6 @@ from crawler import crawl_single
 from extractor import extract_from_page, extract_quote
 from prefetch import start_scheduler
 from shop_crawler import search_product, RETAILERS
-
-load_dotenv()
 
 # ---------------------------------------------------------------------------
 # Logging

@@ -14,6 +14,9 @@ import os
 import re
 from typing import Optional, Type
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from openai import AsyncOpenAI, RateLimitError
 from pydantic import BaseModel
 
@@ -29,7 +32,7 @@ _llm_semaphore = asyncio.Semaphore(1)  # Prevent NVIDIA API 429 Too Many Request
 def _get_client() -> AsyncOpenAI:
     global _client
     if _client is None:
-        api_key = os.getenv("LLM_API_KEY", "")
+        api_key = os.getenv("LLM_API_KEY", "") or os.getenv("OPENROUTER_KEY", "") or os.getenv("OPENROUTER_API_KEY", "")
         base_url = os.getenv("LLM_BASE_URL", "https://integrate.api.nvidia.com/v1")
         if not api_key:
             raise RuntimeError(
@@ -46,7 +49,7 @@ def _get_client() -> AsyncOpenAI:
 # ---------------------------------------------------------------------------
 _MODEL = os.getenv("LLM_MODEL", "deepseek-ai/deepseek-v4-pro")
 _FALLBACK_MODEL = os.getenv("LLM_FALLBACK_MODEL", "deepseek-ai/deepseek-v4-flash")
-_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "4096"))
+_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "16384"))
 _TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.1"))  # low for factual extraction
 
 
@@ -198,9 +201,10 @@ async def llm_health_check() -> bool:
         resp = await client.chat.completions.create(
             model=_MODEL,
             messages=[{"role": "user", "content": "Reply with the single word: ok"}],
-            max_tokens=5,
+            max_tokens=25,
             temperature=0,
         )
-        return bool(resp.choices[0].message.content)
+        # Handle reasoning models where content might be empty but reasoning/choices exist
+        return len(resp.choices) > 0 and (bool(resp.choices[0].message.content) or hasattr(resp.choices[0].message, 'reasoning'))
     except Exception:
         return False
