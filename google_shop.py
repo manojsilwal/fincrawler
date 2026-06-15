@@ -39,6 +39,7 @@ from stealth import apply_stealth, get_stealth_context_kwargs
 
 from shop_price_extract import (
     extract_google_listings_from_page,
+    price_rich_excerpt,
     prepare_llm_context,
     shop_result_missing_price,
 )
@@ -269,7 +270,9 @@ async def google_shop_search(
 
     page_text = crawl.get("page_text") or crawl.get("text") or ""
     html = crawl.get("html") or ""
-    llm_context, _ = prepare_llm_context(page_text, html, query, "google_shopping")
+    llm_context = price_rich_excerpt(page_text, html)
+    if len(llm_context) < 500:
+        llm_context, _ = prepare_llm_context(page_text, html, query, "google_shopping")
     prompt = _GOOGLE_SHOP_PROMPT.format(query=query)
     extracted = await extract_structured(
         page_text=llm_context,

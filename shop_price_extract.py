@@ -450,6 +450,30 @@ def extract_google_listings_from_page(
     return listings
 
 
+def price_rich_excerpt(page_text: str, html: str, max_len: int = 24_000) -> str:
+    """Keep only lines/chunks that likely contain merchant + price signals."""
+    plain = re.sub(r"<[^>]+>", " ", f"{page_text or ''}\n{html or ''}")
+    plain = re.sub(r"\s+", " ", plain)
+    retailers = ("walmart", "amazon", "ebay", "best buy", "target", "osmo", "pocket", "dji")
+    chunks: list[str] = []
+    for m in re.finditer(r".{0,120}\$\d[\d,]*(?:\.\d{2})?.{0,120}", plain, re.IGNORECASE):
+        chunk = m.group(0)
+        if any(r in chunk.lower() for r in retailers):
+            chunks.append(chunk.strip())
+    if not chunks:
+        for token in retailers:
+            for m in re.finditer(rf".{{0,80}}{token}.{{0,200}}", plain, re.IGNORECASE):
+                chunks.append(m.group(0).strip())
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for c in chunks:
+        if c not in seen:
+            seen.add(c)
+            deduped.append(c)
+    excerpt = "\n".join(deduped)
+    return excerpt[:max_len] if excerpt else (page_text or "")[:max_len]
+
+
 def shop_result_missing_price(result: dict) -> bool:
     """True when crawl succeeded but we have no usable price."""
     if result.get("status") not in ("ok", "ok_via_google"):
