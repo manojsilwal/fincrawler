@@ -1,0 +1,57 @@
+{
+  "amazon": {
+    "name": "Amazon",
+    "default_tier": 3,
+    "warm_session": true,
+    "homepage_url": "https://www.amazon.com",
+    "wait_selector": "#search, #s-results-list-atf, [data-component-type='s-search-result']",
+    "consent_selectors": ["#sp-cc-accept", "[data-cel-widget='sp-cc-accept']"],
+    "product_markers": ["s-search-result", "data-component-type=\"s-search-result\"", "priceToPay"],
+    "min_usable_chars": 20000,
+    "scroll_wait_ms": 5000
+  },
+  "walmart": {
+    "name": "Walmart",
+    "default_tier": 3,
+    "warm_session": true,
+    "homepage_url": "https://www.walmart.com",
+    "wait_selector": "[data-automation-id='product-title'], [data-testid='list-view'], [data-item-id]",
+    "consent_selectors": ["[data-automation='close-cta']", "#onetrust-accept-btn-handler"],
+    "product_markers": ["product-title", "currentprice", "product-price", "data-item-id", "search-result"],
+    "min_usable_chars": 8000,
+    "scroll_wait_ms": 8000
+  },
+  "ebay": {
+    "name": "eBay",
+    "default_tier": 3,
+    "warm_session": false,
+    "homepage_url": "https://www.ebay.com",
+    "wait_selector": ".s-item__title, .s-card, #srp-river-results, li.s-card",
+    "consent_selectors": ["#gdpr-banner-accept", ".gh-consent-btn-accept"],
+    "product_markers": ["s-item__title", "s-card", "srp-river-results", "itemprop=\"price\"", "s-card__price"],
+    "min_usable_chars": 15000,
+    "scroll_wait_ms": 6000
+  },
+  "bestbuy": {
+    "name": "Best Buy",
+    "default_tier": 2,
+    "warm_session": true,
+    "homepage_url": "https://www.bestbuy.com",
+    "wait_selector": ".sku-title, .product-list-container, [data-testid='product-list'], .product-title",
+    "consent_selectors": [".us-link", "#accept-cookie-btn", "button[data-track='Accept']", "[aria-label='Accept']"],
+    "product_markers": ["sku-title", "product-list-container", "priceView", "customerPrice"],
+    "min_usable_chars": 8000,
+    "scroll_wait_ms": 8000
+  },
+  "target": {
+    "name": "Target",
+    "default_tier": 3,
+    "warm_session": true,
+    "homepage_url": "https://www.target.com",
+    "wait_selector": "[data-test='product-title'], [data-test='@web/site-top-of-funnel/ProductCardWrapper'], [data-test='current-price']",
+    "consent_selectors": ["#accept", "[data-test='age-verification-button']"],
+    "product_markers": ["ProductCardWrapper", "data-test=\"product-title\"", "current-price", "product-card"],
+    "min_usable_chars": 12000,
+    "scroll_wait_ms": 8000
+  }
+}

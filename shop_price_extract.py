@@ -8,6 +8,7 @@ relevant chunks, and backfill when the LLM returns null.
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any, Optional
 
@@ -86,13 +87,39 @@ def _add_price(found: set[float], raw: str) -> None:
         found.add(round(val, 2))
 
 
+def _sanitize_page_text(text: str) -> str:
+    """Drop CSS-heavy blobs that poison LLM extraction (common on eBay SPAs)."""
+    if not text:
+        return ""
+    stripped = text.strip()
+    if stripped.startswith(":root") or stripped.startswith("@charset") or stripped.startswith("{"):
+        # Prefer lines that look like visible content
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        content_lines = [
+            ln for ln in lines
+            if not ln.startswith((":", "@", "{", "}", "--"))
+            and len(ln) > 3
+            and not re.match(r"^[\s\{\};:@#.\-0-9%]+$", ln)
+        ]
+        if content_lines:
+            return "\n".join(content_lines)[:350_000]
+        return ""
+    return text
+
+
+def _strip_html_noise(html: str) -> str:
+    if not html:
+        return ""
+    return re.sub(r"<(script|style|noscript)[^>]*>.*?</\1>", " ", html, flags=re.I | re.S)
+
+
 def extract_prices_from_html(html: str, retailer_key: str | None = None) -> list[float]:
     """Pull USD prices from HTML/JSON patterns (retailer-aware extras)."""
     if not html:
         return []
 
     found: set[float] = set()
-    blob = html[:500_000]
+    blob = _strip_html_noise(html)[:500_000]
 
     for m in re.finditer(
         r'"(?:price|currentPrice|listPrice|minPrice|maxPrice|priceDisplay|'
@@ -143,22 +170,93 @@ def extract_prices_from_html(html: str, retailer_key: str | None = None) -> list
             re.IGNORECASE,
         ):
             _add_price(found, m.group(1))
-
-    if retailer_key == "ebay":
         for m in re.finditer(
-            r'class="[^"]*s-item__price[^"]*"[^>]*>\s*\$?\s*(\d{1,3}(?:,\d{3})+|\d+(?:\.\d{2})?)',
+            r'"currentPrice"\s*:\s*(\d+(?:\.\d+)?)',
             blob,
             re.IGNORECASE,
         ):
             _add_price(found, m.group(1))
         for m in re.finditer(
+            r'"price"\s*:\s*(\d+(?:\.\d+)?)\s*,\s*"currency"\s*:\s*"USD"',
+            blob,
+            re.IGNORECASE,
+        ):
+            _add_price(found, m.group(1))
+        for m in re.finditer(
+            r'"priceInfo"\s*:\s*\{[^}]*"currentPrice"\s*:\s*\{[^}]*"price"\s*:\s*(\d+(?:\.\d+)?)',
+            blob,
+            re.IGNORECASE,
+        ):
+            _add_price(found, m.group(1))
+        nd_m = re.search(
+            r'<script[^>]*id=["\']__NEXT_DATA__["\'][^>]*>(\{.*?\})</script>',
+            blob,
+            re.I | re.S,
+        )
+        if nd_m:
+            try:
+                _walk_walmart_prices(json.loads(nd_m.group(1)), found)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                pass
+
+    if retailer_key == "ebay":
+        for pattern in (
+            r'class="[^"]*s-item__price[^"]*"[^>]*>\s*\$?\s*(\d{1,3}(?:,\d{3})+|\d+(?:\.\d{2})?)',
+            r'class="[^"]*s-card__price[^"]*"[^>]*>\s*\$?\s*(\d{1,3}(?:,\d{3})+|\d+(?:\.\d{2})?)',
+            r'class="[^"]*default__price[^"]*"[^>]*>\s*\$?\s*(\d{1,3}(?:,\d{3})+|\d+(?:\.\d{2})?)',
+            r'itemprop=["\']price["\'][^>]*content=["\']([\d.]+)["\']',
             r'"price"\s*:\s*"?\$?(\d{1,3}(?:,\d{3})+|\d+(?:\.\d{2})?)"?',
+            r'"displayPrice"\s*:\s*"?\$?(\d{1,3}(?:,\d{3})+|\d+(?:\.\d{2})?)"?',
+            r'"value"\s*:\s*(\d{1,3}(?:,\d{3})+|\d+(?:\.\d{2})?)\s*,\s*"currency"\s*:\s*"USD"',
+        ):
+            for m in re.finditer(pattern, blob, re.IGNORECASE):
+                _add_price(found, m.group(1))
+
+    if retailer_key == "bestbuy":
+        for pattern in (
+            r'"customerPrice"\s*:\s*(\d+(?:\.\d+)?)',
+            r'"currentPrice"\s*:\s*(\d+(?:\.\d+)?)',
+            r'"salePrice"\s*:\s*(\d+(?:\.\d+)?)',
+            r'"regularPrice"\s*:\s*(\d+(?:\.\d+)?)',
+            r'class="[^"]*priceView-hero-price[^"]*"[^>]*>\s*\$?\s*(\d[\d,]*(?:\.\d{2})?)',
+        ):
+            for m in re.finditer(pattern, blob, re.IGNORECASE):
+                _add_price(found, m.group(1))
+
+    if retailer_key == "target":
+        for m in re.finditer(
+            r'data-test=["\']current-price["\'][^>]*>\s*\$?\s*(\d[\d,]*(?:\.\d{2})?)',
+            blob,
+            re.IGNORECASE,
+        ):
+            _add_price(found, m.group(1))
+        for m in re.finditer(
+            r'"current_retail(?:_min)?"\s*:\s*(\d+(?:\.\d+)?)',
             blob,
             re.IGNORECASE,
         ):
             _add_price(found, m.group(1))
 
     return sorted(found)[:20]
+
+
+def _walk_walmart_prices(node, found: set[float], depth: int = 0) -> None:
+    if depth > 12:
+        return
+    if isinstance(node, dict):
+        cp = node.get("currentPrice")
+        if isinstance(cp, dict) and "price" in cp:
+            _add_price(found, str(cp["price"]))
+        elif isinstance(cp, (int, float)):
+            _add_price(found, str(cp))
+        price = node.get("price")
+        if isinstance(price, (int, float)):
+            _add_price(found, str(price))
+        for v in node.values():
+            _walk_walmart_prices(v, found, depth + 1)
+    elif isinstance(node, list):
+        for item in node[:40]:
+            _walk_walmart_prices(item, found, depth + 1)
 
 
 def extract_prices_from_visible_text(text: str) -> list[float]:
@@ -175,6 +273,16 @@ def extract_prices_from_visible_text(text: str) -> list[float]:
     return sorted(found)[:20]
 
 
+def _query_price_floor(query: str) -> float:
+    """Minimum plausible USD price for the searched product (filters accessory noise)."""
+    q = query.lower()
+    if re.search(r"osmo|pocket\s*[34]|action\s*cam", q):
+        return 280.0
+    if re.search(r"\b(iphone|macbook|ipad\s*pro|playstation|xbox|gpu|rtx|drone|gimbal)\b", q):
+        return 120.0
+    return 25.0
+
+
 def pick_best_price(
     candidates: list[float],
     *,
@@ -188,14 +296,27 @@ def pick_best_price(
     """
     if not candidates:
         return None
-    if len(candidates) == 1:
-        return candidates[0]
 
-    # Drop very low outliers (cases, cables) when higher prices exist
-    high = [p for p in candidates if p >= 80]
-    pool = high if high else candidates
+    floor = _query_price_floor(query)
+    filtered = [p for p in candidates if p >= floor]
+    pool = filtered if filtered else candidates
 
-    # Walmart/eBay search: lowest matching listing is usually the device
+    if len(pool) == 1:
+        return pool[0]
+
+    # Drop very low outliers when higher prices exist
+    high = [p for p in pool if p >= max(floor, 80)]
+    pool = high if high else pool
+
+    if len(pool) >= 2:
+        lo, hi = min(pool), max(pool)
+        if hi / max(lo, 1) >= 3.0:
+            sorted_p = sorted(pool)
+            pivot = sorted_p[max(0, len(sorted_p) // 2)]
+            cluster = [p for p in pool if p >= pivot * 0.75]
+            if cluster:
+                pool = cluster
+
     if retailer_key in ("walmart", "ebay", "amazon", "target", "bestbuy"):
         return min(pool)
 
@@ -211,7 +332,8 @@ def prepare_llm_context(
     """
     Build a focused LLM context string and pre-extracted price candidates.
     """
-    html_prices = extract_prices_from_html(html, retailer_key)
+    page_text = _sanitize_page_text(page_text)
+    html_prices = extract_prices_from_html(_strip_html_noise(html), retailer_key)
     text_prices = extract_prices_from_visible_text(page_text)
     candidates = sorted(set(html_prices + text_prices))[:20]
 
@@ -244,9 +366,9 @@ _RETAILER_PROMPT_HINTS: dict[str, str] = {
         "or embedded JSON currentPrice. Return the current selling price in USD."
     ),
     "ebay": (
-        "eBay search results: use Buy It Now or fixed price (class s-item__price). "
+        "eBay search results: use Buy It Now or fixed price (s-item__price or s-card__price). "
         "Ignore auction starting bids under $5 and accessory listings. "
-        "Pick the best-matching listing for the exact product."
+        "Pick the best-matching listing for the exact product. Price must be a number."
     ),
     "amazon": (
         "Amazon search: use the main search result price (not sponsored accessories). "
@@ -276,6 +398,11 @@ def merge_shop_extraction(
     Backfill missing LLM price from regex candidates; annotate price_source.
     """
     data = dict(llm_data) if llm_data else {}
+    name = (data.get("product_name") or data.get("title") or "").strip()
+    if name.startswith((":root", "@charset", "{", "--")) or "border-width" in name:
+        data.pop("product_name", None)
+        data.pop("title", None)
+
     if "_error" in data and data.get("_error") not in ("product_not_found",):
         return data
 
@@ -283,17 +410,20 @@ def merge_shop_extraction(
     if price is not None:
         try:
             price = float(price)
-            if price > 0:
+            floor = _query_price_floor(query)
+            if price >= floor:
                 data["price"] = round(price, 2)
                 data.setdefault("price_source", "llm")
                 if "_error" in data:
                     del data["_error"]
                 return data
+            data["price"] = None
         except (TypeError, ValueError):
             data["price"] = None
 
     fallback = pick_best_price(candidates, query=query, retailer_key=retailer_key)
-    if fallback is not None:
+    floor = _query_price_floor(query)
+    if fallback is not None and fallback >= floor:
         data["price"] = fallback
         data["price_source"] = "regex"
         data["price_candidates_usd"] = candidates

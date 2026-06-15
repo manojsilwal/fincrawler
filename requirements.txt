@@ -1,11 +1,16 @@
-playwright==1.44.0
 fastapi
 uvicorn[standard]
 httpx
-curl_cffi>=0.6.0
-aiocache[msgpack]
-apscheduler
 python-dotenv
 openai>=1.30.0
-# Optional Tier 2 (falls back to Tier 3 if not installed):
-# scrapling
+sqlalchemy>=2.0
+psycopg[binary]>=3.1
+redis>=5.0
+aiocache[msgpack]
+apscheduler
+pydantic>=2.0
+pytest>=8.0
+pytest-asyncio>=0.23
+playwright>=1.49.0
+curl_cffi>=0.7.0
+ruff

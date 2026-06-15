@@ -218,8 +218,34 @@ def _parse_json_response(raw: str) -> dict:
         except json.JSONDecodeError:
             pass
 
+    salvaged = _salvage_partial_json(cleaned)
+    if salvaged:
+        logger.info("Salvaged partial LLM JSON fields: %s", list(salvaged.keys()))
+        return salvaged
+
     logger.warning("Could not parse LLM response as JSON: %s…", raw[:200])
     return {"_error": "json_parse_failed", "_llm_raw": raw}
+
+
+def _salvage_partial_json(raw: str) -> dict | None:
+    """Recover key fields when the model returns truncated but mostly-valid JSON."""
+    if not raw or "{" not in raw:
+        return None
+    out: dict = {}
+    for key in ("product_name", "title", "availability", "seller"):
+        m = re.search(rf'"{key}"\s*:\s*"((?:[^"\\]|\\.)*)"', raw)
+        if m:
+            out[key] = m.group(1).replace('\\"', '"')
+    for key in ("price", "original_price", "rating", "review_count"):
+        m = re.search(rf'"{key}"\s*:\s*([\d.]+)', raw)
+        if m:
+            try:
+                out[key] = float(m.group(1))
+            except ValueError:
+                pass
+    if out.get("price") or out.get("product_name") or out.get("title"):
+        return out
+    return None
 
 
 # ---------------------------------------------------------------------------

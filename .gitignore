@@ -1,6 +1,19 @@
 # Environment
 .env
+.env.gcp
 *.env
+
+# Local databases / test artifacts
+*.db
+test_*.db
+data/snapshots/
+
+# One-off migration scripts (not part of the app)
+fix_*.py
+update_*.py
+sync_*.py
+move_*.py
+fincrawler_env_gcp
 
 # Python
 __pycache__/

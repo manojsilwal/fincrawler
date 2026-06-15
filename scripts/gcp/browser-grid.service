@@ -1,0 +1,16 @@
+[Unit]
+Description=FinCrawler Browser Grid Worker
+After=network.target docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/fincrawler
+EnvironmentFile=/opt/fincrawler/.env.gcp
+ExecStart=/usr/bin/docker compose -f docker-compose.gcp.yml run --rm browser-grid-worker
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -1,81 +1,62 @@
-# FinCrawler Tiered Crawl API Contract
+# FinCrawler Hybrid Compliant API Contract
 
-Shared contract between **FinCrawler** (this repo) and **Zenith Rewards** worker client.
+Shared contract between **FinCrawler** (`app/`) and **Zenith Rewards** worker client.
 
-Zenith sends tier hints via `fincrawler_client.py`; this service implements the engine in:
+## Tier model (hybrid)
 
-- `tier_router.py` — escalation across tiers
-- `fetchers/tier1_curl_cffi.py` — TLS impersonation (curl_cffi, httpx fallback)
-- `fetchers/tier2_scrapling.py` — JS render (Scrapling, Tier 3 fallback)
-- `fetchers/tier3_stealth_browser.py` — Playwright stealth (Camoufox/CloakBrowser-class)
-- `fetchers/tier4_managed.py` — Scrapfly / proxy-backed fetch
-- `behavior/human_sim.py` — mouse, scroll, dwell simulation
-- `session/store.py` — sticky sessions by `session_id`
-- `profiles/retailers.json` — per-retailer default tiers
+| Tier | `tier_name` | Tool | When |
+|------|-------------|------|------|
+| 1 | `compliant` | Honest httpx User-Agent | First attempt for allowed URLs |
+| 2 | `tls_impersonate` | Internal ASP `curl_cffi` | Fast path for light retailers |
+| 3 | `stealth_browser` | Internal ASP stealth Playwright | Session warm, JS render, challenge handling |
+| 4 | `bank_grade` | Internal ASP proxy fallback (`MANAGED_PROXY_URL`) | After browser block; optional external Scrapfly if `ENABLE_EXTERNAL_SCRAPFLY=true` |
 
-## Tier model
+Escalation triggers: CAPTCHA, `403`, `429`, login wall, `/blocked` URL, thin challenge pages.
 
-| Tier | `tier_name` | Tool | When to use |
-|------|-------------|------|-------------|
-| 1 | `static_api` | curl_cffi (TLS impersonation) | Static HTML, public APIs |
-| 2 | `js_rendered` | Scrapling StealthyFetcher | JS-rendered SPAs |
-| 3 | `advanced_antibot` | Playwright stealth + human sim | Turnstile / DataDome / behavioral ML |
-| 4 | `bank_grade` | Scrapfly / managed proxy + warm identity | Hard targets after Tier 3 fails |
+Hard stop only when Tier 4 still blocked → source `blocked_or_rate_limited`.
 
 ## Endpoints
 
 | Method | Path | Notes |
 |--------|------|-------|
-| POST | `/scrape` | Tiered URL scrape |
-| POST | `/crawl` | Alias of `/scrape` (Zenith default path) |
-| POST | `/shop/search` | Multi-retailer fan-out with per-retailer escalation |
-| POST | `/shop/google?query=...` | Google Shopping; optional JSON body for tier envelope |
-| POST | `/extract` | Crawl + LLM extract (uses tiered crawl) |
+| POST | `/asp/scrape` | Internal ASP managed scrape |
+| GET | `/asp/health` | ASP engine liveness |
+| POST | `/sources` | Source registry CRUD |
+| POST | `/crawl-jobs/url` | Compliant hybrid fetch single URL |
+| GET | `/crawl-jobs/events` | Compliance event log |
+| POST | `/shop/search` | Live multi-retailer search (Zenith primary) |
+| POST | `/shop/google` | **410 Gone** — removed |
+| POST | `/crawl`, `/scrape` | Zenith compat alias |
+| GET | `/products/search` | DB product search |
+| GET | `/rankings/search` | Ranked offers from DB |
 
-## Request envelope (optional on crawl endpoints)
-
-```json
-{
-  "tier": 3,
-  "tier_name": "advanced_antibot",
-  "max_tier": 4,
-  "auto_escalate": true,
-  "session_id": "amazon-uuid",
-  "warm_session": true,
-  "proxy": { "url": "http://...", "sticky": true, "geo": "us" },
-  "behavior": { "mouse": true, "scroll": true, "dwell_ms": 1200, "resource_completeness": true },
-  "retailer_key": "amazon",
-  "fingerprint_profile": "chrome_mac_us"
-}
-```
-
-## Response envelope (on every crawl result)
+## Response envelope
 
 ```json
 {
   "status": "ok",
-  "tier_used": 3,
-  "tier_name": "advanced_antibot",
-  "detection_hits": [],
+  "tier_used": 4,
+  "tier_name": "bank_grade",
+  "escalated_from": "captcha_detected",
+  "detection_hits": ["captcha_detected"],
   "block_reason": null,
-  "session_id": "amazon-abc123",
   "http_status": 200
 }
 ```
 
-### Detection hit vocabulary
-
-`tls`, `http2_frame`, `browser_fingerprint`, `automation_signals`, `ip_reputation`, `behavioral_ml`, `captcha`, `js_pow`, `request_patterns`, `cookie_session`
-
-## Environment variables
+## Environment
 
 | Variable | Purpose |
 |----------|---------|
-| `API_KEY` | Auth header |
-| `SCRAPFLY_API_KEY` | Tier 4 managed API |
-| `MANAGED_PROXY_URL` | Tier 4 proxy fallback |
-| `LLM_*` | DeepSeek extraction |
+| `DATABASE_URL` | PostgreSQL |
+| `REDIS_URL` | Queue/cache |
+| `API_KEY` | Client auth |
+| `SCRAPFLY_API_KEY` | Tier 4 (required for Walmart/Amazon/eBay search) |
+| `MANAGED_PROXY_URL` | Tier 4 fallback |
+| `CRAWLER_USER_AGENT` | Honest bot identity for Tier 1 |
+| `LLM_*` | Product extraction |
 
-## Per-retailer profiles
+## Sources
 
-See `profiles/retailers.json`. Zenith may override via request envelope.
+Retailer search sources live in PostgreSQL `sources` table (`scripts/seed_sources.py`).
+`source_type`: `managed_retailer_search` with `robots_policy: advisory`.

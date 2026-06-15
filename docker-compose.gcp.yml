@@ -1,7 +1,30 @@
-# FinCrawler on GCP
-# Deploy: docker compose -f docker-compose.gcp.yml up -d --build
+# FinCrawler on GCP — hybrid compliant stack
 
 services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: shopping_intel
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
   fincrawler:
     build:
       context: .
@@ -11,17 +34,62 @@ services:
       - "10000:10000"
     env_file: .env.gcp
     environment:
-      # Port matches EXPOSE inside Dockerfile
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/shopping_intel
+      REDIS_URL: redis://redis:6379/0
       PORT: "10000"
+      ENABLE_BROWSER_GRID: "true"
+      ENABLE_INTERNAL_EGRESS: "true"
+      BROWSER_PROXY_ENABLED: "true"
+      PROXY_BACKEND: "internal"
+      INTERNAL_EGRESS_ENDPOINTS: "http://egress-proxy:3128"
+      PROXY_POOL_REDIS: "true"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      egress-proxy:
+        condition: service_started
+    volumes:
+      - fincrawler-data:/app/data
+    command: >
+      sh -c "python scripts/seed_sources.py && uvicorn app.main:app --host 0.0.0.0 --port 10000"
     healthcheck:
       test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:10000/health"]
       interval: 30s
       timeout: 10s
       start_period: 40s
       retries: 3
-    # Optional caching volume if we decide to mount any files persistently
-    volumes:
-      - fincrawler-data:/app/data
+
+  browser-grid-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file: .env.gcp
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      ENABLE_BROWSER_GRID: "true"
+      ENABLE_BROWSER_TIER4: "true"
+      ENABLE_BRIGHTDATA_PROVIDER: "false"
+      BROWSER_PROXY_ENABLED: "true"
+      ENABLE_INTERNAL_EGRESS: "true"
+      INTERNAL_EGRESS_ENDPOINTS: "http://egress-proxy:3128"
+    depends_on:
+      redis:
+        condition: service_healthy
+      egress-proxy:
+        condition: service_started
+    command: python -m app.workers.browser_grid_worker
+
+  egress-proxy:
+    build:
+      context: .
+      dockerfile: docker/squid/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "13128:3128"
 
 volumes:
+  pgdata:
   fincrawler-data:

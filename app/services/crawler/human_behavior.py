@@ -1,0 +1,68 @@
+"""Human-like delays, scrolling, and consent dismissal."""
+
+from __future__ import annotations
+
+import asyncio
+import random
+
+
+async def human_delay(min_ms: int = 800, max_ms: int = 2200) -> None:
+    await asyncio.sleep(random.uniform(min_ms / 1000, max_ms / 1000))
+
+
+async def human_scroll(page) -> None:
+    try:
+        await page.evaluate(
+            """
+            async () => {
+                await new Promise((resolve) => {
+                    let pos = 0;
+                    const step = () => {
+                        const delta = Math.floor(Math.random() * 180) + 60;
+                        window.scrollBy(0, delta);
+                        pos += delta;
+                        if (pos < document.body.scrollHeight * 0.75) {
+                            setTimeout(step, Math.floor(Math.random() * 120) + 40);
+                        } else {
+                            resolve();
+                        }
+                    };
+                    setTimeout(step, 200);
+                });
+            }
+            """
+        )
+        await human_delay(600, 1200)
+    except Exception:
+        try:
+            await page.evaluate("window.scrollTo(0, Math.min(document.body.scrollHeight, 6000))")
+        except Exception:
+            pass
+
+
+async def simulate_mouse_move(page) -> None:
+    try:
+        viewport = page.viewport_size or {"width": 1280, "height": 720}
+        x = random.randint(80, max(100, viewport["width"] - 80))
+        y = random.randint(80, max(100, viewport["height"] - 80))
+        await page.mouse.move(x, y, steps=random.randint(8, 18))
+    except Exception:
+        pass
+
+
+async def run_behavior(page) -> None:
+    await simulate_mouse_move(page)
+    await page.wait_for_timeout(random.randint(900, 1800))
+    await human_scroll(page)
+
+
+async def dismiss_consent(page, selectors: list[str]) -> None:
+    for sel in selectors:
+        try:
+            loc = page.locator(sel)
+            if await loc.count() > 0:
+                await loc.first.click(timeout=3_000)
+                await human_delay(400, 800)
+                return
+        except Exception:
+            continue
