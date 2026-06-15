@@ -27,6 +27,11 @@ from playwright.async_api import TimeoutError as PlaywrightTimeout
 
 from browser_pool import pool
 from llm import extract_structured
+from shop_price_extract import (
+    merge_shop_extraction,
+    prepare_llm_context,
+    retailer_prompt_hint,
+)
 from stealth import apply_stealth, get_stealth_context_kwargs
 
 from profiles import retailers_dict
@@ -147,29 +152,72 @@ async def _extract_shop_result(crawl: dict, query: str) -> dict:
     if crawl["status"] != "ok":
         return {**crawl, "data": None}
 
+    retailer_key = crawl.get("retailer_key", "")
     page_text = crawl.get("page_text") or crawl.get("text") or ""
+    html = crawl.get("html") or ""
+
+    llm_context, price_candidates = prepare_llm_context(
+        page_text, html, query, retailer_key
+    )
+
+    hint = retailer_prompt_hint(retailer_key)
     prompt = _SHOP_PROMPT_TEMPLATE.format(query=query)
+    if hint:
+        prompt = f"{hint}\n\n{prompt}"
+
     extracted = await extract_structured(
-        page_text=page_text,
+        page_text=llm_context,
         prompt=prompt,
-        extra_context=f"Retailer: {crawl['retailer']}. Product search: {query}",
+        extra_context=f"Retailer: {crawl.get('retailer', retailer_key)}. Product search: {query}",
+        task="shopping",
+    )
+
+    extracted = merge_shop_extraction(
+        extracted,
+        price_candidates,
+        query=query,
+        retailer_key=retailer_key,
     )
 
     # Basic name-matching validation to prevent accessory hallucination
     if "_error" not in extracted and extracted.get("product_name"):
         name = extracted["product_name"].lower()
         q = query.lower()
-        # If the query words are not in the name, but price is suspiciously low
         query_words = [w for w in q.split() if len(w) > 2]
         matches = sum(1 for w in query_words if w in name)
-        if matches < len(query_words) / 2 and extracted.get("price", 0) < 50:
-             logger.warning("[%s] Extraction rejected: product name mismatch or suspiciously low price for %s", crawl['retailer_key'], query)
-             extracted = {"_error": "product_name_mismatch", "product_name": extracted["product_name"], "price": extracted["price"]}
+        price = extracted.get("price")
+        if (
+            matches < len(query_words) / 2
+            and price is not None
+            and float(price) < 50
+            and extracted.get("price_source") != "regex"
+        ):
+            logger.warning(
+                "[%s] Extraction rejected: product name mismatch or suspiciously low price for %s",
+                retailer_key,
+                query,
+            )
+            extracted = {
+                "_error": "product_name_mismatch",
+                "product_name": extracted["product_name"],
+                "price": extracted["price"],
+            }
+            # Regex backfill after rejection
+            extracted = merge_shop_extraction(
+                extracted,
+                price_candidates,
+                query=query,
+                retailer_key=retailer_key,
+            )
 
-    # Attach without the raw page_text blob (too large for response)
-    result = {k: v for k, v in crawl.items() if k != "page_text"}
+    # Attach without the raw page_text/html blobs (too large for response)
+    result = {
+        k: v for k, v in crawl.items() if k not in ("page_text", "html")
+    }
     result["data"] = extracted
-    result["llm_extraction"] = "_error" not in extracted
+    result["llm_extraction"] = "_error" not in extracted or bool(extracted.get("price"))
+    if price_candidates:
+        result["price_candidates_usd"] = price_candidates
     return result
 
 

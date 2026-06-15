@@ -37,6 +37,8 @@ from browser_pool import pool
 from llm import extract_structured
 from stealth import apply_stealth, get_stealth_context_kwargs
 
+from shop_price_extract import shop_result_missing_price
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -267,6 +269,7 @@ async def google_shop_search(
         page_text=page_text,
         prompt=prompt,
         extra_context=f"Product search query: {query}",
+        task="shopping",
     )
 
     listings = []
@@ -329,9 +332,18 @@ def enrich_with_google(
     enriched = []
     for r in retailer_results:
         rkey = r.get("retailer_key", "")
+        needs_google = shop_result_missing_price(r) and rkey in google_by_key
         if r.get("status") in ("blocked", "error") and rkey in google_by_key:
+            needs_google = True
+
+        if needs_google and rkey in google_by_key:
             g = google_by_key[rkey]
-            r = {**r, "data": g, "status": "ok_via_google", "llm_extraction": True}
+            r = {
+                **r,
+                "data": {**g, "price_source": "google_shopping"},
+                "status": "ok_via_google",
+                "llm_extraction": True,
+            }
             logger.info("Enriched %s from Google Shopping", r.get("retailer", rkey))
         enriched.append(r)
     return enriched

@@ -103,7 +103,7 @@ async def fetch_retailer(
 
     while tier <= max_tier:
         envelope.tier = tier
-        if tier == 3 or (tier == 2 and retailer_key in ("amazon", "walmart", "target", "bestbuy")):
+        if tier == 3 or (tier == 2 and retailer_key in ("amazon", "walmart", "target", "bestbuy", "ebay")):
             result = await fetch_retailer_search(retailer_key, query, envelope, retailer_config)
         else:
             import urllib.parse

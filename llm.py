@@ -63,12 +63,44 @@ Return ONLY a valid JSON object matching the user's schema.
 Never invent data. If a field cannot be found, use null.
 Do not include markdown fences, explanations, or any text outside the JSON object."""
 
+_SHOP_SYSTEM_PROMPT = """You are a precise e-commerce data extraction assistant.
+Given retail search page text, extract product and price information accurately.
+Return ONLY a single valid JSON object — no markdown fences, no commentary.
+Never invent prices. Use null for missing fields.
+If pre-detected price candidates are provided, pick the one that matches the requested product.
+The price field must be a number (USD), not a string like "$419.00"."""
+
+
+def _message_text(message) -> str:
+    """Collect LLM output; reasoning models (e.g. minimax-m3) may use alternate fields."""
+    content = (getattr(message, "content", None) or "").strip()
+    if content:
+        return content
+    for attr in ("reasoning", "reasoning_content"):
+        val = getattr(message, attr, None)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    details = getattr(message, "reasoning_details", None)
+    if isinstance(details, list):
+        parts = []
+        for item in details:
+            if isinstance(item, dict):
+                text = item.get("text") or item.get("content") or ""
+                if text:
+                    parts.append(str(text))
+            elif isinstance(item, str):
+                parts.append(item)
+        if parts:
+            return "\n".join(parts)
+    return content
+
 
 async def extract_structured(
     page_text: str,
     prompt: str,
     schema: Optional[Type[BaseModel]] = None,
     extra_context: Optional[str] = None,
+    task: str = "finance",
 ) -> dict:
     """
     Send ``page_text`` + ``prompt`` to the LLM and parse the JSON response.
@@ -103,7 +135,7 @@ async def extract_structured(
         except Exception:
             pass
 
-    system_content = _SYSTEM_PROMPT
+    system_content = _SHOP_SYSTEM_PROMPT if task == "shopping" else _SYSTEM_PROMPT
     if extra_context:
         system_content += f"\n\nAdditional context: {extra_context}"
     if schema_hint:
@@ -138,7 +170,7 @@ async def extract_structured(
                     stream=False,
                 )
 
-            raw = response.choices[0].message.content or ""
+            raw = _message_text(response.choices[0].message)
             logger.info("LLM raw response: %s", raw[:500])
             return _parse_json_response(raw)
 
