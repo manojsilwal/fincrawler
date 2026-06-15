@@ -59,11 +59,11 @@ class Settings:
         self.browser_pool_size = int(os.getenv("BROWSER_POOL_SIZE", "2"))
         self.browser_nav_timeout_ms = int(os.getenv("BROWSER_NAV_TIMEOUT_MS", "35000"))
         self.browser_headless = os.getenv("BROWSER_HEADLESS", "true").lower() == "true"
-        self.challenge_wait_ms = int(os.getenv("CHALLENGE_WAIT_MS", "12000"))
+        self.challenge_wait_ms = int(os.getenv("CHALLENGE_WAIT_MS", "6000"))
 
         self.asp_provider_order = os.getenv(
             "ASP_PROVIDER_ORDER",
-            "browser_grid,http_impersonate,js_browser,captcha_browser,proxy_http,"
+            "http_impersonate,browser_grid,captcha_browser,proxy_http,"
             "brightdata_scraping_browser,brightdata_unlocker,external_scrapfly",
         )
         self.enable_brightdata_provider = (
@@ -88,7 +88,7 @@ class Settings:
         self.browser_proxy_enabled = (
             os.getenv("BROWSER_PROXY_ENABLED", "true").lower() == "true"
         )
-        self.browser_proxy_max_retries = int(os.getenv("BROWSER_PROXY_MAX_RETRIES", "3"))
+        self.browser_proxy_max_retries = int(os.getenv("BROWSER_PROXY_MAX_RETRIES", "2"))
 
         self.smartproxy_user = os.getenv("SMARTPROXY_USER", "")
         self.smartproxy_password = os.getenv("SMARTPROXY_PASSWORD", "")
@@ -114,7 +114,7 @@ class Settings:
         self.enable_antibot_solver = os.getenv("ENABLE_ANTIBOT_SOLVER", "true").lower() == "true"
         self.antibot_px_hold_ms_min = int(os.getenv("ANTIBOT_PX_HOLD_MS_MIN", "2800"))
         self.antibot_px_hold_ms_max = int(os.getenv("ANTIBOT_PX_HOLD_MS_MAX", "5200"))
-        self.antibot_max_attempts = int(os.getenv("ANTIBOT_MAX_ATTEMPTS", "3"))
+        self.antibot_max_attempts = int(os.getenv("ANTIBOT_MAX_ATTEMPTS", "2"))
         self.antibot_cookie_ttl_seconds = int(os.getenv("ANTIBOT_COOKIE_TTL_SECONDS", "3600"))
 
         # Provider health / budget (Phase 2 hybrid)
@@ -129,10 +129,13 @@ class Settings:
             "BROWSER_GRID_QUEUE_KEY", "fincrawler:browser_grid:jobs"
         )
         self.browser_grid_timeout_seconds = float(
-            os.getenv("BROWSER_GRID_TIMEOUT_SECONDS", "120")
+            os.getenv("BROWSER_GRID_TIMEOUT_SECONDS", "75")
         )
         self.browser_grid_poll_interval_ms = int(
             os.getenv("BROWSER_GRID_POLL_INTERVAL_MS", "500")
+        )
+        self.browser_grid_worker_concurrency = int(
+            os.getenv("BROWSER_GRID_WORKER_CONCURRENCY", "2")
         )
 
         self.log_level = os.getenv("LOG_LEVEL", "INFO")

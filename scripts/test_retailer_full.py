@@ -31,7 +31,7 @@ async def main():
         print(f"SCRAPFLY: {bool(os.getenv('SCRAPFLY_API_KEY', '').strip())}")
         print(f"LLM: {bool(os.getenv('LLM_API_KEY', '').strip() or os.getenv('OPENROUTER_API_KEY', '').strip())}")
         print("-" * 72)
-        results = await search_product(db, query=query, max_concurrency=2)
+        results = await search_product(db, query=query, max_concurrency=5)
         summary = []
         for r in results:
             data = r.get("data") or {}

@@ -43,6 +43,11 @@ services:
       PROXY_BACKEND: "internal"
       INTERNAL_EGRESS_ENDPOINTS: "http://egress-proxy:3128"
       PROXY_POOL_REDIS: "true"
+      ASP_PROVIDER_ORDER: "http_impersonate,browser_grid,captcha_browser,proxy_http"
+      CHALLENGE_WAIT_MS: "6000"
+      BROWSER_PROXY_MAX_RETRIES: "2"
+      ANTIBOT_MAX_ATTEMPTS: "2"
+      BROWSER_GRID_TIMEOUT_SECONDS: "75"
     depends_on:
       postgres:
         condition: service_healthy
@@ -75,6 +80,11 @@ services:
       BROWSER_PROXY_ENABLED: "true"
       ENABLE_INTERNAL_EGRESS: "true"
       INTERNAL_EGRESS_ENDPOINTS: "http://egress-proxy:3128"
+      ASP_PROVIDER_ORDER: "http_impersonate,browser_grid,captcha_browser,proxy_http"
+      CHALLENGE_WAIT_MS: "6000"
+      BROWSER_PROXY_MAX_RETRIES: "2"
+      ANTIBOT_MAX_ATTEMPTS: "2"
+      BROWSER_GRID_WORKER_CONCURRENCY: "2"
     depends_on:
       redis:
         condition: service_healthy

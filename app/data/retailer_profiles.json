@@ -54,7 +54,7 @@
     "product_markers": ["ProductCardWrapper", "data-test=\"product-title\"", "current-price", "product-card", "ProductCard", "data-test=\"product-grid\"", "styles__StyledTitleLink"],
     "min_usable_chars": 10000,
     "scroll_wait_ms": 12000,
-    "hydration_wait_ms": 6000,
+    "hydration_wait_ms": 3000,
     "extra_scroll": true
   }
 }

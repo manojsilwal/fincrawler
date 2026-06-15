@@ -72,10 +72,42 @@ async def _process_job(job: dict) -> dict:
     return {k: v for k, v in result.items() if k not in ("html",)}
 
 
-async def run_worker() -> None:
-    from app.services.browser_grid.queue import dequeue_scrape, store_result
-    import redis.asyncio as aioredis
+async def _run_job_with_semaphore(job: dict, sem: asyncio.Semaphore, client) -> None:
     from app.config import get_settings
+
+    settings = get_settings()
+    job_id = job.get("job_id", "unknown")
+    async with sem:
+        try:
+            result = await _process_job(job)
+            key = f"fincrawler:browser_grid:result:{job_id}"
+            await client.setex(key, 600, json.dumps(result))
+            logger.info(
+                "Job %s done: status=%s chars=%s",
+                job_id,
+                result.get("status"),
+                result.get("char_count"),
+            )
+        except Exception:
+            logger.exception("Job %s failed", job_id)
+            await client.setex(
+                f"fincrawler:browser_grid:result:{job_id}",
+                600,
+                json.dumps(
+                    {
+                        "url": job.get("url"),
+                        "status": "error",
+                        "error": "browser_grid_worker_exception",
+                        "fetch_backend": "browser_grid",
+                        "browser_grid_job_id": job_id,
+                    }
+                ),
+            )
+
+
+async def run_worker() -> None:
+    from app.config import get_settings
+    import redis.asyncio as aioredis
 
     worker_id = os.getenv("BROWSER_GRID_WORKER_ID", os.getenv("HOSTNAME", "local"))
     logger.info("Browser grid worker started (id=%s)", worker_id)
@@ -84,11 +116,25 @@ async def run_worker() -> None:
     settings = get_settings()
     client = aioredis.from_url(settings.redis_url, decode_responses=True)
     queue_key = settings.browser_grid_queue_key
+    sem = asyncio.Semaphore(settings.browser_grid_worker_concurrency)
+    in_flight: set[asyncio.Task] = set()
 
     try:
         while _running:
+            done = {t for t in in_flight if t.done()}
+            in_flight -= done
+            for task in done:
+                try:
+                    task.result()
+                except Exception:
+                    logger.exception("Browser grid job task failed")
+
+            if len(in_flight) >= settings.browser_grid_worker_concurrency:
+                await asyncio.sleep(0.1)
+                continue
+
             try:
-                item = await client.brpop(queue_key, timeout=5)
+                item = await client.brpop(queue_key, timeout=1)
             except TimeoutError:
                 continue
             except Exception as exc:
@@ -107,33 +153,11 @@ async def run_worker() -> None:
                 await asyncio.sleep(0.3)
                 continue
 
-            job_id = job.get("job_id", "unknown")
-            try:
-                result = await _process_job(job)
-                key = f"fincrawler:browser_grid:result:{job_id}"
-                await client.setex(key, 600, json.dumps(result))
-                logger.info(
-                    "Job %s done: status=%s chars=%s",
-                    job_id,
-                    result.get("status"),
-                    result.get("char_count"),
-                )
-            except Exception:
-                logger.exception("Job %s failed", job_id)
-                await client.setex(
-                    f"fincrawler:browser_grid:result:{job_id}",
-                    600,
-                    json.dumps(
-                        {
-                            "url": job.get("url"),
-                            "status": "error",
-                            "error": "browser_grid_worker_exception",
-                            "fetch_backend": "browser_grid",
-                            "browser_grid_job_id": job_id,
-                        }
-                    ),
-                )
+            task = asyncio.create_task(_run_job_with_semaphore(job, sem, client))
+            in_flight.add(task)
     finally:
+        if in_flight:
+            await asyncio.gather(*in_flight, return_exceptions=True)
         await client.aclose()
 
 

@@ -67,7 +67,7 @@ class CrawlJobUrlRequest(BaseModel):
 class ShopSearchRequest(BaseModel):
     query: str
     retailers: Optional[list[str]] = None
-    max_concurrency: int = Field(default=2, ge=1, le=5)
+    max_concurrency: int = Field(default=5, ge=1, le=5)
 
 
 class ProductOut(BaseModel):

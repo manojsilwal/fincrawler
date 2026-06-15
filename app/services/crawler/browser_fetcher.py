@@ -78,7 +78,7 @@ async def _handle_challenge(page, profile: dict, wait_ms: int) -> str | None:
     if reason in ("cloudflare_challenge", "captcha"):
         try:
             await page.reload(wait_until="domcontentloaded", timeout=25_000)
-            await page.wait_for_timeout(6_000)
+            await page.wait_for_timeout(3_000)
             await dismiss_consent(page, profile.get("consent_selectors", []))
             reason = await _detect_block(page)
         except Exception:
@@ -157,7 +157,7 @@ async def _fetch_stealth_browser_once(
             wait_sel = profile.get("wait_selector")
             if wait_sel and not block_reason:
                 try:
-                    await page.wait_for_selector(wait_sel, timeout=12_000, state="visible")
+                    await page.wait_for_selector(wait_sel, timeout=6_000, state="visible")
                 except Exception:
                     pass
 
@@ -171,7 +171,7 @@ async def _fetch_stealth_browser_once(
                     await run_behavior(page)
                     if wait_sel:
                         try:
-                            await page.wait_for_selector(wait_sel, timeout=10_000, state="visible")
+                            await page.wait_for_selector(wait_sel, timeout=6_000, state="visible")
                         except Exception:
                             pass
 

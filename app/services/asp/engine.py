@@ -101,7 +101,7 @@ class AspEngine:
             await record_failure(provider.name, error=str(err) if err else None)
             logger.info("[%s] %s (%s)", retailer_key, provider.name, err)
 
-        if retry_on_block and retailer_key and render_js:
+        if retry_on_block and retailer_key and render_js and "browser_grid" not in attempts:
             local = LocalBrowserProvider()
             if local.should_try(ctx, {}):
                 clear_warmed(retailer_key)

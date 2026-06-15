@@ -63,7 +63,9 @@ chmod +x scripts/gcp/deploy_internal_egress.sh
 ```
 
 **Provider order (default):**
-`browser_grid → http_impersonate → js_browser → captcha_browser → proxy_http → brightdata_* → scrapfly`
+`http_impersonate → browser_grid → captcha_browser → proxy_http → brightdata_* → scrapfly`
+
+(`js_browser` is omitted when grid is enabled — grid workers already run the same stealth fetch; avoids duplicate 30–40s passes per retailer.)
 
 ## Phase 2 — Hybrid
 
@@ -94,7 +96,9 @@ ENABLE_INTERNAL_EGRESS=true
 PROXY_BACKEND=internal
 BROWSER_PROXY_ENABLED=true
 PROXY_POOL_REDIS=true
-ASP_PROVIDER_ORDER=browser_grid,http_impersonate,js_browser,captcha_browser,proxy_http
+ASP_PROVIDER_ORDER=http_impersonate,browser_grid,captcha_browser,proxy_http
+BROWSER_GRID_WORKER_CONCURRENCY=2
+BROWSER_GRID_TIMEOUT_SECONDS=75
 
 # Local with Squid egress sidecar
 docker compose -f docker-compose.gcp.yml up -d egress-proxy fincrawler browser-grid-worker
