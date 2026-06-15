@@ -37,7 +37,11 @@ from browser_pool import pool
 from llm import extract_structured
 from stealth import apply_stealth, get_stealth_context_kwargs
 
-from shop_price_extract import shop_result_missing_price
+from shop_price_extract import (
+    extract_google_listings_from_page,
+    prepare_llm_context,
+    shop_result_missing_price,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -50,20 +54,20 @@ _GOOGLE_SHOP_URL_ALT = "https://www.google.com/search?q={query}+buy+price&tbm=sh
 # ---------------------------------------------------------------------------
 # LLM prompt
 # ---------------------------------------------------------------------------
-_GOOGLE_SHOP_PROMPT = """ This is a Google Shopping search results page for "{query}".
-Extract ALL product listings visible on the page.
-CRITICAL RULES:
-- ONLY include the actual product requested ("{query}").
-- EXCLUDE accessories, cases, protection plans, and unrelated items.
-- If a listing is for a "Case for {query}" or "Protection for {query}", IGNORE it.
-- Ensure the price extracted is for the device itself.
+_GOOGLE_SHOP_PROMPT = """This is a Google Shopping search results page for "{query}".
+Extract ALL product listings visible on the page for the exact product "{query}".
 
-Return a JSON object with a single key "listings" containing an array.
-...
-Rules:
-- Include EVERY valid product listing, not just the first one.
-- Use null for any field not visible.
-- Do not invent data."""
+CRITICAL RULES:
+- ONLY include the actual product requested.
+- EXCLUDE accessories, cases, protection plans, and unrelated items.
+- price must be a JSON number (e.g. 419.00), not a string.
+
+Return exactly this JSON shape:
+{{"listings": [
+  {{"retailer": "Walmart", "price": 419.00, "product_name": "...", "availability": "In stock", "product_url": null}}
+]}}
+
+Include every valid listing you can see. Use null for missing optional fields."""
 
 # ---------------------------------------------------------------------------
 # Retailer name normalisation → canonical keys
@@ -264,9 +268,11 @@ async def google_shop_search(
         }
 
     page_text = crawl.get("page_text") or crawl.get("text") or ""
+    html = crawl.get("html") or ""
+    llm_context, _ = prepare_llm_context(page_text, html, query, "google_shopping")
     prompt = _GOOGLE_SHOP_PROMPT.format(query=query)
     extracted = await extract_structured(
-        page_text=page_text,
+        page_text=llm_context,
         prompt=prompt,
         extra_context=f"Product search query: {query}",
         task="shopping",
@@ -279,11 +285,17 @@ async def google_shop_search(
             for item in raw_list[:max_listings]:
                 if isinstance(item, dict) and item.get("price"):
                     item["retailer_key"] = _normalise_retailer(item.get("retailer", ""))
+                    item.setdefault("price_source", "llm")
                     listings.append(item)
         elif isinstance(extracted, dict) and "price" in extracted:
-            # LLM returned a single item instead of array
             extracted["retailer_key"] = _normalise_retailer(extracted.get("retailer", ""))
+            extracted.setdefault("price_source", "llm")
             listings = [extracted]
+
+    if not listings:
+        listings = extract_google_listings_from_page(page_text, html, query)[:max_listings]
+        if listings:
+            logger.info("Google Shopping regex fallback found %d listings", len(listings))
 
     listings.sort(key=lambda x: x.get("price") or float("inf"))
 

@@ -3,6 +3,8 @@
 import pytest
 
 from shop_price_extract import (
+    crawl_likely_blocked,
+    extract_google_listings_from_page,
     extract_prices_from_html,
     extract_prices_from_visible_text,
     merge_shop_extraction,
@@ -78,6 +80,18 @@ def test_prepare_llm_context_includes_candidates():
     )
     assert candidates
     assert "Pre-detected USD price candidates" in context
+
+
+def test_crawl_likely_blocked_walmart_url():
+    assert crawl_likely_blocked({"url": "https://www.walmart.com/blocked?url=foo", "char_count": 5000})
+
+
+def test_extract_google_listings_from_page():
+    text = "DJI Osmo Pocket 3\nWalmart\n$419.00\nFree delivery\nAmazon\n$429.00"
+    listings = extract_google_listings_from_page(text, "", "DJI Osmo Pocket 3")
+    keys = {x["retailer_key"] for x in listings}
+    assert "walmart" in keys
+    assert "amazon" in keys
 
 
 def test_shop_result_missing_price():

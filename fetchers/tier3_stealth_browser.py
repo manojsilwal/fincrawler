@@ -30,6 +30,8 @@ async def _detect_block(page) -> str | None:
         pass
     if "robot" in body or "captcha" in body:
         return "captcha"
+    if "/blocked" in url or "walmart.com/blocked" in url:
+        return "blocked"
     if "access denied" in title or "access denied" in body:
         return "access_denied"
     if "cloudflare" in body or "just a moment" in title:
@@ -112,6 +114,17 @@ async def fetch_tier3(
             page_text = "\n".join(cleaned)[:80_000]
             title = await page.title()
             html = await page.content()
+
+            if len(page_text) < 2500 and await _detect_block(page):
+                final_block = await _detect_block(page) or "bot_challenge"
+                return {
+                    "url": page.url,
+                    "status": "blocked",
+                    "block_reason": final_block,
+                    "http_status": http_status,
+                    "char_count": len(page_text),
+                    "crawled_at": crawled_at,
+                }
 
             return {
                 "url": page.url,

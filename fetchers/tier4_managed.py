@@ -45,6 +45,7 @@ async def fetch_tier4(url: str, envelope: CrawlEnvelope) -> dict:
                     or ""
                 )
                 status = payload.get("result", {}).get("status_code") or 200
+                final_url = payload.get("result", {}).get("url") or url
         else:
             proxy = envelope.proxy.get("url") if envelope.proxy else os.getenv("MANAGED_PROXY_URL")
             async with httpx.AsyncClient(
@@ -61,26 +62,47 @@ async def fetch_tier4(url: str, envelope: CrawlEnvelope) -> dict:
                 r = await client.get(url)
                 html = r.text
                 status = r.status_code
+                final_url = str(r.url)
 
         title_m = re.search(r"<title[^>]*>([^<]{1,500})</title>", html, re.IGNORECASE | re.DOTALL)
         title = title_m.group(1).strip() if title_m else ""
         text = _clean_text(re.sub(r"<[^>]+>", " ", html), max_chars)
-        blocked = status in (403, 503) or "captcha" in html[:5000].lower()
+        html_head = html[:12_000].lower()
+        blocked = (
+            status in (403, 503)
+            or "/blocked" in final_url.lower()
+            or "walmart.com/blocked" in html_head
+            or any(
+                n in html_head
+                for n in (
+                    "captcha",
+                    "robot check",
+                    "verify you are human",
+                    "px-captcha",
+                    "access denied",
+                    "unusual traffic",
+                )
+            )
+        )
         if blocked:
+            block_reason = "ip_blocked" if status in (403, 503) else "bot_challenge"
+            if "/blocked" in final_url.lower():
+                block_reason = "blocked"
             return {
-                "url": url,
+                "url": final_url,
                 "title": title,
                 "text": text,
                 "html": html[:max_chars],
                 "http_status": status,
                 "status": "blocked",
-                "block_reason": "ip_blocked" if status in (403, 503) else "captcha_required",
+                "block_reason": block_reason,
                 "crawled_at": crawled_at,
             }
         return {
-            "url": url,
+            "url": final_url,
             "title": title,
             "text": text,
+            "page_text": text,
             "html": html[:max_chars],
             "http_status": status,
             "char_count": len(text),

@@ -28,6 +28,7 @@ from playwright.async_api import TimeoutError as PlaywrightTimeout
 from browser_pool import pool
 from llm import extract_structured
 from shop_price_extract import (
+    crawl_likely_blocked,
     merge_shop_extraction,
     prepare_llm_context,
     retailer_prompt_hint,
@@ -151,6 +152,18 @@ async def _extract_shop_result(crawl: dict, query: str) -> dict:
     """Run LLM extraction on a successful crawl result."""
     if crawl["status"] != "ok":
         return {**crawl, "data": None}
+
+    if crawl_likely_blocked(crawl):
+        logger.warning(
+            "[%s] Treating thin/challenge page as blocked (chars=%s)",
+            crawl.get("retailer_key"),
+            crawl.get("char_count"),
+        )
+        result = {k: v for k, v in crawl.items() if k not in ("page_text", "html")}
+        result["status"] = "blocked"
+        result["block_reason"] = crawl.get("block_reason") or "bot_challenge"
+        result["data"] = None
+        return result
 
     retailer_key = crawl.get("retailer_key", "")
     page_text = crawl.get("page_text") or crawl.get("text") or ""

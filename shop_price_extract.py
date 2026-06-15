@@ -306,6 +306,100 @@ def merge_shop_extraction(
     return data
 
 
+def crawl_likely_blocked(crawl: dict) -> bool:
+    """Detect bot-wall pages that still return HTTP 200."""
+    url = (crawl.get("url") or "").lower()
+    if "/blocked" in url or "challenge" in url:
+        return True
+
+    title = (crawl.get("title") or "").lower()
+    if any(n in title for n in ("robot", "blocked", "access denied", "captcha")):
+        return True
+
+    text = (crawl.get("page_text") or crawl.get("text") or "")[:12_000]
+    blob = text.lower()
+    needles = (
+        "robot or human",
+        "robot check",
+        "verify you are human",
+        "unusual traffic",
+        "access denied",
+        "px-captcha",
+        "please enable javascript",
+        "automated access",
+    )
+    if any(n in blob for n in needles):
+        return True
+
+    # Very short body after a retailer search usually means a challenge interstitial
+    char_count = crawl.get("char_count") or len(text)
+    if char_count < 2500 and any(n in blob for n in ("captcha", "security", "sign in")):
+        return True
+
+    return False
+
+
+def extract_google_listings_from_page(
+    page_text: str,
+    html: str,
+    query: str,
+) -> list[dict]:
+    """
+    Regex fallback for Google Shopping when the LLM returns empty listings.
+    """
+    retailer_patterns: dict[str, list[str]] = {
+        "amazon": [r"\bamazon(?:\.com)?\b"],
+        "walmart": [r"\bwalmart(?:\.com)?\b"],
+        "ebay": [r"\bebay(?:\.com)?\b"],
+        "bestbuy": [r"\bbest\s*buy(?:\.com)?\b", r"\bbestbuy(?:\.com)?\b"],
+        "target": [r"\btarget(?:\.com)?\b"],
+    }
+
+    found: dict[str, dict] = {}
+
+    def _record(key: str, price: float, source: str) -> None:
+        if price is None:
+            return
+        existing = found.get(key)
+        if existing is None or price < existing["price"]:
+            found[key] = {
+                "retailer": key.replace("bestbuy", "Best Buy").title().replace("Best Buy", "Best Buy"),
+                "retailer_key": key,
+                "price": price,
+                "price_source": source,
+                "product_name": query,
+            }
+
+    # aria-label blobs often contain merchant + price
+    for blob in (html or "", page_text or ""):
+        for m in re.finditer(r'aria-label=["\']([^"\']{8,240})["\']', blob, re.IGNORECASE):
+            label = m.group(1)
+            label_lower = label.lower()
+            prices = extract_prices_from_visible_text(label)
+            if not prices:
+                continue
+            for key, patterns in retailer_patterns.items():
+                if any(re.search(p, label_lower) for p in patterns):
+                    price = pick_best_price(prices, query=query, retailer_key=key)
+                    _record(key, price, "regex_aria")
+
+    lines = (page_text or "").splitlines()
+    for i, line in enumerate(lines):
+        lower = line.lower()
+        window = "\n".join(lines[max(0, i - 1) : i + 4])
+        prices = extract_prices_from_visible_text(window)
+        if not prices:
+            continue
+        for key, patterns in retailer_patterns.items():
+            if any(re.search(p, lower) for p in patterns):
+                price = pick_best_price(prices, query=query, retailer_key=key)
+                _record(key, price, "regex_text")
+
+    listings = list(found.values())
+    listings.sort(key=lambda x: x.get("price") or float("inf"))
+    return listings
+
+
 def shop_result_missing_price(result: dict) -> bool:
     """True when crawl succeeded but we have no usable price."""
     if result.get("status") not in ("ok", "ok_via_google"):
