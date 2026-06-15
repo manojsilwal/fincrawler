@@ -98,6 +98,9 @@ async def fetch_retailer(
 
     tier = int(envelope.tier or profile.get("default_tier", 2))
     max_tier = int(envelope.max_tier or 4)
+    if retailer_key == "google_shopping":
+        # Tier 4 httpx strips merchant/price structure; keep Google on Playwright.
+        max_tier = min(max_tier, 3)
     retailer_config = {**profile, "retailer_key": retailer_key}
     last: dict[str, Any] = {"status": "error", "error": "not_attempted"}
 

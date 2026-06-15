@@ -333,6 +333,9 @@ def crawl_likely_blocked(crawl: dict) -> bool:
 
     # Very short body after a retailer search usually means a challenge interstitial
     char_count = crawl.get("char_count") or len(text)
+    retailer_key = crawl.get("retailer_key", "")
+    if retailer_key in ("ebay", "walmart", "amazon", "target", "bestbuy") and char_count < 2000:
+        return True
     if char_count < 2500 and any(n in blob for n in ("captcha", "security", "sign in")):
         return True
 
@@ -357,21 +360,45 @@ def extract_google_listings_from_page(
 
     found: dict[str, dict] = {}
 
-    def _record(key: str, price: float, source: str) -> None:
+    def _record(key: str, price: float | None, source: str) -> None:
         if price is None:
             return
         existing = found.get(key)
         if existing is None or price < existing["price"]:
+            display = {
+                "amazon": "Amazon",
+                "walmart": "Walmart",
+                "ebay": "eBay",
+                "bestbuy": "Best Buy",
+                "target": "Target",
+            }.get(key, key.title())
             found[key] = {
-                "retailer": key.replace("bestbuy", "Best Buy").title().replace("Best Buy", "Best Buy"),
+                "retailer": display,
                 "retailer_key": key,
                 "price": price,
                 "price_source": source,
                 "product_name": query,
             }
 
-    # aria-label blobs often contain merchant + price
-    for blob in (html or "", page_text or ""):
+    def _scan_blob(blob: str, source: str) -> None:
+        if not blob:
+            return
+        # Embedded JSON blobs on Google Shopping pages
+        for m in re.finditer(
+            r'"(?:merchant|seller|store|retailer)"\s*:\s*"([^"]{2,40})".{0,300}?'
+            r'"(?:price|extracted_price|price_str)"\s*:\s*"?(\$?\d[\d,]*(?:\.\d{2})?)"?',
+            blob,
+            re.IGNORECASE | re.DOTALL,
+        ):
+            merchant = m.group(1)
+            prices = extract_prices_from_visible_text(m.group(2))
+            if not prices:
+                continue
+            for key, patterns in retailer_patterns.items():
+                if any(re.search(p, merchant, re.IGNORECASE) for p in patterns):
+                    _record(key, pick_best_price(prices, query=query, retailer_key=key), source)
+
+        # aria-label blobs often contain merchant + price
         for m in re.finditer(r'aria-label=["\']([^"\']{8,240})["\']', blob, re.IGNORECASE):
             label = m.group(1)
             label_lower = label.lower()
@@ -380,20 +407,43 @@ def extract_google_listings_from_page(
                 continue
             for key, patterns in retailer_patterns.items():
                 if any(re.search(p, label_lower) for p in patterns):
-                    price = pick_best_price(prices, query=query, retailer_key=key)
-                    _record(key, price, "regex_aria")
+                    _record(
+                        key,
+                        pick_best_price(prices, query=query, retailer_key=key),
+                        source,
+                    )
 
-    lines = (page_text or "").splitlines()
-    for i, line in enumerate(lines):
-        lower = line.lower()
-        window = "\n".join(lines[max(0, i - 1) : i + 4])
-        prices = extract_prices_from_visible_text(window)
-        if not prices:
-            continue
+        # Proximity: retailer mention in HTML near a dollar price
         for key, patterns in retailer_patterns.items():
-            if any(re.search(p, lower) for p in patterns):
-                price = pick_best_price(prices, query=query, retailer_key=key)
-                _record(key, price, "regex_text")
+            for pat in patterns:
+                for m in re.finditer(pat, blob, re.IGNORECASE):
+                    window = blob[m.start() : m.start() + 900]
+                    plain = re.sub(r"<[^>]+>", " ", window)
+                    prices = extract_prices_from_visible_text(plain)
+                    if prices:
+                        _record(
+                            key,
+                            pick_best_price(prices, query=query, retailer_key=key),
+                            source,
+                        )
+
+        lines = blob.splitlines()
+        for i, line in enumerate(lines):
+            lower = line.lower()
+            window = "\n".join(lines[max(0, i - 1) : i + 4])
+            prices = extract_prices_from_visible_text(window)
+            if not prices:
+                continue
+            for key, patterns in retailer_patterns.items():
+                if any(re.search(p, lower) for p in patterns):
+                    _record(
+                        key,
+                        pick_best_price(prices, query=query, retailer_key=key),
+                        source,
+                    )
+
+    _scan_blob(page_text or "", "regex_text")
+    _scan_blob(html or "", "regex_html")
 
     listings = list(found.values())
     listings.sort(key=lambda x: x.get("price") or float("inf"))

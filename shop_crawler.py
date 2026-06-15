@@ -231,6 +231,17 @@ async def _extract_shop_result(crawl: dict, query: str) -> dict:
     result["llm_extraction"] = "_error" not in extracted or bool(extracted.get("price"))
     if price_candidates:
         result["price_candidates_usd"] = price_candidates
+
+    # Thin pages with no price are almost always bot interstitials
+    if (
+        result.get("status") == "ok"
+        and not extracted.get("price")
+        and (crawl.get("char_count") or 0) < 2000
+    ):
+        result["status"] = "blocked"
+        result["block_reason"] = result.get("block_reason") or "bot_challenge"
+        result["data"] = None
+
     return result
 
 

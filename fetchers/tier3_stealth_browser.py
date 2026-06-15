@@ -78,9 +78,17 @@ async def fetch_tier3(
 
             block_reason = await _detect_block(page)
             if block_reason in ("cloudflare_challenge", "captcha"):
-                logger.warning("Challenge detected (%s), waiting 8s", block_reason)
-                await page.wait_for_timeout(8_000)
+                logger.warning("Challenge detected (%s), waiting 12s", block_reason)
+                await page.wait_for_timeout(12_000)
                 block_reason = await _detect_block(page)
+                if block_reason in ("cloudflare_challenge", "captcha"):
+                    try:
+                        await page.reload(wait_until="domcontentloaded", timeout=25_000)
+                        await page.wait_for_timeout(6_000)
+                        await dismiss_consent(page, cfg.get("consent_selectors", []))
+                        block_reason = await _detect_block(page)
+                    except Exception:
+                        pass
 
             wait_sel = cfg.get("wait_selector")
             if wait_sel:
