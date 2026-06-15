@@ -12,7 +12,11 @@ class CaptchaBrowserProvider(AspProvider):
 
     def is_available(self) -> bool:
         settings = get_settings()
-        return settings.enable_browser_tier4 and bool(get_captcha_solvers())
+        if not settings.enable_browser_tier4:
+            return False
+        if settings.enable_antibot_solver:
+            return True
+        return bool(get_captcha_solvers())
 
     def should_try(self, ctx: ScrapeContext, profile: dict) -> bool:
         return self.is_available() and self._circuit_ok() and ctx.render_js
@@ -29,4 +33,4 @@ class CaptchaBrowserProvider(AspProvider):
                 "fetch_backend": self.name,
                 "crawled_at": ctx.crawled_at,
             }
-        return await fetch_with_captcha_solve(ctx.url, retailer_key=ctx.retailer_key)
+        return await fetch_with_captcha_solve(ctx.url, retailer_key=ctx.retailer_key, proxy_url=ctx.proxy)

@@ -22,11 +22,29 @@ class SourceRegistry:
         return db.get(Source, source_id)
 
     def get_by_retailer(self, db: Session, retailer_key: str) -> Source | None:
-        return (
+        active = (
             db.query(Source)
             .filter(Source.retailer_key == retailer_key, Source.status == "active")
             .first()
         )
+        if active:
+            return active
+        # Managed retailers always escalate through the ASP engine; a transient block
+        # should never make them disappear. Auto-heal an inactive managed source.
+        managed = (
+            db.query(Source)
+            .filter(
+                Source.retailer_key == retailer_key,
+                Source.source_type == "managed_retailer_search",
+            )
+            .first()
+        )
+        if managed and managed.status != "active":
+            managed.status = "active"
+            managed.allowed = True
+            db.commit()
+            db.refresh(managed)
+        return managed
 
     def list_all(self, db: Session) -> list[Source]:
         return db.query(Source).order_by(Source.name).all()

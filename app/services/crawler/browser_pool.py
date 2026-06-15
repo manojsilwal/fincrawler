@@ -48,7 +48,13 @@ class BrowserPool:
         self._started = False
 
     @asynccontextmanager
-    async def page(self, *, proxy_url: str | None = None, retailer_key: str = ""):
+    async def page(
+        self,
+        *,
+        proxy_url: str | None = None,
+        retailer_key: str = "",
+        storage_state: dict | None = None,
+    ):
         if not self._started or self._browser is None or self._semaphore is None:
             raise RuntimeError("BrowserPool not started")
         async with self._semaphore:
@@ -58,11 +64,13 @@ class BrowserPool:
             pw_proxy = playwright_proxy_kwargs(proxy_url)
             if pw_proxy:
                 kwargs["proxy"] = pw_proxy
+            if storage_state:
+                kwargs["storage_state"] = storage_state
             context: BrowserContext = await self._browser.new_context(**kwargs)
             page: Page = await context.new_page()
             await apply_stealth(page, retailer_key)
             try:
-                yield page
+                yield page, context
             finally:
                 await context.close()
 

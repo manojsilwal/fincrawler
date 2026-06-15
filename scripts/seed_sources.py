@@ -49,9 +49,17 @@ def main():
     init_db()
     db = SessionLocal()
     try:
+        seeded = 0
+        reactivated = 0
         for r in RETAILERS:
             existing = db.query(Source).filter(Source.retailer_key == r["retailer_key"]).first()
             if existing:
+                # Managed retailers always escalate through the ASP engine, so a transient
+                # block must never leave them permanently inactive. Self-heal on startup.
+                if existing.source_type == "managed_retailer_search" and existing.status != "active":
+                    existing.status = "active"
+                    existing.allowed = True
+                    reactivated += 1
                 continue
             db.add(
                 Source(
@@ -68,8 +76,9 @@ def main():
                     max_requests_per_minute=6,
                 )
             )
+            seeded += 1
         db.commit()
-        print(f"Seeded {len(RETAILERS)} retailer sources")
+        print(f"Seeded {seeded} new retailer sources, reactivated {reactivated}")
     finally:
         db.close()
 

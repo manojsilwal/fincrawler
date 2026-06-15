@@ -15,6 +15,7 @@
     "default_tier": 3,
     "warm_session": true,
     "homepage_url": "https://www.walmart.com",
+    "antibot": "perimeterx",
     "wait_selector": "[data-automation-id='product-title'], [data-testid='list-view'], [data-item-id]",
     "consent_selectors": ["[data-automation='close-cta']", "#onetrust-accept-btn-handler"],
     "product_markers": ["product-title", "currentprice", "product-price", "data-item-id", "search-result"],
@@ -24,12 +25,12 @@
   "ebay": {
     "name": "eBay",
     "default_tier": 3,
-    "warm_session": false,
+    "warm_session": true,
     "homepage_url": "https://www.ebay.com",
-    "wait_selector": ".s-item__title, .s-card, #srp-river-results, li.s-card",
-    "consent_selectors": ["#gdpr-banner-accept", ".gh-consent-btn-accept"],
-    "product_markers": ["s-item__title", "s-card", "srp-river-results", "itemprop=\"price\"", "s-card__price"],
-    "min_usable_chars": 15000,
+    "wait_selector": ".s-item__title, .s-card, #srp-river-results, li.s-card, ul.srp-results, .srp-results li",
+    "consent_selectors": ["#gdpr-banner-accept", ".gh-consent-btn-accept", "#gdpr-banner-decline"],
+    "product_markers": ["s-item__title", "s-card", "srp-river-results", "itemprop=\"price\"", "s-card__price", "srp-results", "s-item__price"],
+    "min_usable_chars": 12000,
     "scroll_wait_ms": 6000
   },
   "bestbuy": {
@@ -48,10 +49,12 @@
     "default_tier": 3,
     "warm_session": true,
     "homepage_url": "https://www.target.com",
-    "wait_selector": "[data-test='product-title'], [data-test='@web/site-top-of-funnel/ProductCardWrapper'], [data-test='current-price']",
-    "consent_selectors": ["#accept", "[data-test='age-verification-button']"],
-    "product_markers": ["ProductCardWrapper", "data-test=\"product-title\"", "current-price", "product-card"],
-    "min_usable_chars": 12000,
-    "scroll_wait_ms": 8000
+    "wait_selector": "[data-test='product-title'], [data-test='@web/site-top-of-funnel/ProductCardWrapper'], [data-test='current-price'], [data-test='product-grid'], [data-test='@web/ProductCard/ProductCardVariantDefault']",
+    "consent_selectors": ["#accept", "[data-test='age-verification-button']", "button[aria-label='close']"],
+    "product_markers": ["ProductCardWrapper", "data-test=\"product-title\"", "current-price", "product-card", "ProductCard", "data-test=\"product-grid\"", "styles__StyledTitleLink"],
+    "min_usable_chars": 10000,
+    "scroll_wait_ms": 12000,
+    "hydration_wait_ms": 6000,
+    "extra_scroll": true
   }
 }

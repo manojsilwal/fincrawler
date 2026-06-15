@@ -42,6 +42,7 @@ async def _heartbeat_egress(worker_id: str) -> None:
 
 async def _process_job(job: dict) -> dict:
     from app.services.crawler.browser_fetcher import fetch_stealth_browser
+    from shop_price_extract import extract_prices_from_html, price_rich_excerpt
 
     url = job["url"]
     retailer_key = job.get("retailer_key") or ""
@@ -57,6 +58,17 @@ async def _process_job(job: dict) -> dict:
     result["fetch_backend"] = "browser_grid"
     result["worker_id"] = os.getenv("BROWSER_GRID_WORKER_ID", os.getenv("HOSTNAME", "local"))
     result["processed_at"] = datetime.now(timezone.utc).isoformat()
+
+    html = result.get("html") or ""
+    page_text = result.get("page_text") or result.get("text") or ""
+    if html:
+        candidates = extract_prices_from_html(html, retailer_key)
+        if candidates:
+            result["price_candidates_usd"] = candidates
+        excerpt = price_rich_excerpt(page_text, html, max_len=24_000)
+        if excerpt:
+            result["price_html_excerpt"] = excerpt
+
     return {k: v for k, v in result.items() if k not in ("html",)}
 
 

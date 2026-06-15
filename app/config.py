@@ -110,6 +110,13 @@ class Settings:
         self.twocaptcha_api_key = os.getenv("TWOCAPTCHA_API_KEY", "")
         self.captcha_provider = os.getenv("CAPTCHA_PROVIDER", "auto")
 
+        # In-house antibot solver (PerimeterX press-and-hold, DataDome slider)
+        self.enable_antibot_solver = os.getenv("ENABLE_ANTIBOT_SOLVER", "true").lower() == "true"
+        self.antibot_px_hold_ms_min = int(os.getenv("ANTIBOT_PX_HOLD_MS_MIN", "2800"))
+        self.antibot_px_hold_ms_max = int(os.getenv("ANTIBOT_PX_HOLD_MS_MAX", "5200"))
+        self.antibot_max_attempts = int(os.getenv("ANTIBOT_MAX_ATTEMPTS", "3"))
+        self.antibot_cookie_ttl_seconds = int(os.getenv("ANTIBOT_COOKIE_TTL_SECONDS", "3600"))
+
         # Provider health / budget (Phase 2 hybrid)
         self.provider_max_failures = int(os.getenv("PROVIDER_MAX_FAILURES", "5"))
         self.provider_circuit_cooldown_seconds = int(

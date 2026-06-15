@@ -36,7 +36,13 @@ _ranker = ProductRanker()
 async def _extract_with_llm(crawl: dict, query: str, retailer_key: str) -> dict:
     page_text = crawl.get("page_text") or crawl.get("text") or ""
     html = crawl.get("html") or ""
+    excerpt = crawl.get("price_html_excerpt") or ""
+    if not html and excerpt:
+        html = excerpt
     llm_context, candidates = prepare_llm_context(page_text, html, query, retailer_key)
+    pre_candidates = crawl.get("price_candidates_usd") or []
+    if pre_candidates:
+        candidates = sorted(set(float(p) for p in pre_candidates) | set(candidates))[:20]
     hint = retailer_prompt_hint(retailer_key)
     prompt = f"{hint}\n\n{_SHOP_PROMPT.format(query=query)}" if hint else _SHOP_PROMPT.format(query=query)
     extracted = await extract_structured(

@@ -93,14 +93,26 @@ async def _fetch_stealth_browser_once(
     proxy_url: str | None = None,
     fetch_backend: str = "asp_js_browser",
 ) -> dict:
+    from app.services.asp.antibot.cookie_store import (
+        egress_id_from_proxy,
+        load_storage_state,
+        save_storage_state,
+    )
+
     settings = get_settings()
     crawled_at = datetime.now(timezone.utc).isoformat()
     profile = get_retailer_profile(retailer_key) if retailer_key else {}
     timeout_ms = settings.browser_nav_timeout_ms
+    egress_id = egress_id_from_proxy(proxy_url)
+    storage_state = await load_storage_state(retailer_key, egress_id) if retailer_key else None
 
     try:
         pool = await get_browser_pool(size=settings.browser_pool_size)
-        async with pool.page(proxy_url=proxy_url, retailer_key=retailer_key) as page:
+        async with pool.page(
+            proxy_url=proxy_url,
+            retailer_key=retailer_key,
+            storage_state=storage_state,
+        ) as (page, context):
             warm = profile.get("warm_session", True)
             homepage = profile.get("homepage_url")
             if warm and homepage and retailer_key and not is_warmed(retailer_key):
@@ -120,6 +132,28 @@ async def _fetch_stealth_browser_once(
             await dismiss_consent(page, profile.get("consent_selectors", []))
 
             block_reason = await _handle_challenge(page, profile, settings.challenge_wait_ms)
+
+            # In-house antibot solver (PerimeterX / DataDome) when passive wait fails
+            if block_reason in ("captcha", "blocked", "cloudflare_challenge") and settings.enable_antibot_solver:
+                from app.services.asp.antibot import solve_challenge
+
+                html_probe = await page.content()
+                vendor_hint = profile.get("antibot")
+                solved = await solve_challenge(
+                    page,
+                    vendor=vendor_hint,
+                    html=html_probe,
+                    url=page.url,
+                )
+                if solved:
+                    block_reason = await _detect_block(page)
+                else:
+                    block_reason = block_reason or await _detect_block(page)
+
+            hydration_wait = profile.get("hydration_wait_ms")
+            if hydration_wait and not block_reason:
+                await page.wait_for_timeout(int(hydration_wait))
+
             wait_sel = profile.get("wait_selector")
             if wait_sel and not block_reason:
                 try:
@@ -128,6 +162,19 @@ async def _fetch_stealth_browser_once(
                     pass
 
             await run_behavior(page)
+
+            # Heavily lazy-loaded SPAs (e.g. Target) may need a second pass to hydrate
+            # product cards before we can read them.
+            if profile.get("extra_scroll") and not block_reason:
+                html_probe = await page.content()
+                if not _has_product_markers(html_probe, profile):
+                    await run_behavior(page)
+                    if wait_sel:
+                        try:
+                            await page.wait_for_selector(wait_sel, timeout=10_000, state="visible")
+                        except Exception:
+                            pass
+
             block_reason = block_reason or await _detect_block(page)
 
             page_text = _clean_body_text(await page.inner_text("body"))
@@ -162,6 +209,13 @@ async def _fetch_stealth_browser_once(
             )
             if blocked:
                 return {**base, "status": "blocked", "block_reason": reason}
+
+            if retailer_key:
+                try:
+                    state = await context.storage_state()
+                    await save_storage_state(retailer_key, state, egress_id)
+                except Exception:
+                    logger.debug("Failed to persist antibot cookies for %s", retailer_key, exc_info=True)
 
             return {**base, "status": "ok"}
     except PlaywrightTimeout:
@@ -209,6 +263,7 @@ async def fetch_stealth_browser(
     use_pool = settings.browser_proxy_enabled and proxy_url is None
     max_attempts = settings.browser_proxy_max_retries if use_pool else 1
     last: dict = {"url": url, "status": "error", "error": "no_attempt"}
+    used_real_proxy = False
 
     for attempt in range(max_attempts):
         pick = proxy_url
@@ -220,6 +275,8 @@ async def fetch_stealth_browser(
                     pick = None
             elif attempt > 0:
                 break
+        if pick:
+            used_real_proxy = True
 
         last = await _fetch_stealth_browser_once(
             url,
@@ -252,6 +309,20 @@ async def fetch_stealth_browser(
             continue
 
         break
+
+    # If every proxied attempt failed, try once directly so a broken egress
+    # node can never take down all fetches.
+    if used_real_proxy and last.get("status") != "ok":
+        logger.info("[%s] proxy attempts exhausted — retrying direct egress", retailer_key)
+        direct = await _fetch_stealth_browser_once(
+            url,
+            retailer_key=retailer_key,
+            proxy_url=None,
+            fetch_backend=fetch_backend,
+        )
+        if direct.get("status") == "ok":
+            return direct
+        last = direct
 
     return last
 
