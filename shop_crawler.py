@@ -29,44 +29,15 @@ from browser_pool import pool
 from llm import extract_structured
 from stealth import apply_stealth, get_stealth_context_kwargs
 
+from profiles import retailers_dict
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Retailer config
+# Retailer config (loaded from profiles/retailers.json)
 # ---------------------------------------------------------------------------
 
-RETAILERS: dict[str, dict] = {
-    "amazon": {
-        "name": "Amazon",
-        "search_url": "https://www.amazon.com/s?k={query}&ref=nb_sb_noss",
-        "wait_selector": "#search, #s-results-list-atf, [data-component-type='s-search-result']",
-        "consent_selectors": ["#sp-cc-accept", "[data-cel-widget='sp-cc-accept']"],
-    },
-    "walmart": {
-        "name": "Walmart",
-        "search_url": "https://www.walmart.com/search?q={query}",
-        "wait_selector": "[data-automation-id='product-title'], .search-result-product-title",
-        "consent_selectors": ["[data-automation='close-cta']", "#onetrust-accept-btn-handler"],
-    },
-    "ebay": {
-        "name": "eBay",
-        "search_url": "https://www.ebay.com/sch/i.html?_nkw={query}&_sacat=0",
-        "wait_selector": ".s-item__title, #srp-river-results",
-        "consent_selectors": ["#gdpr-banner-accept", ".gh-consent-btn-accept"],
-    },
-    "bestbuy": {
-        "name": "Best Buy",
-        "search_url": "https://www.bestbuy.com/site/searchpage.jsp?st={query}",
-        "wait_selector": ".sku-title, .sr-only, .priceView-hero-price",
-        "consent_selectors": [".us-link", "#accept-cookie-btn"],
-    },
-    "target": {
-        "name": "Target",
-        "search_url": "https://www.target.com/s?searchTerm={query}",
-        "wait_selector": "[data-test='product-title'], .ProductCardVariantDefault-module__title",
-        "consent_selectors": ["#accept", "[data-test='age-verification-button']"],
-    },
-}
+RETAILERS: dict[str, dict] = retailers_dict()
 
 # ---------------------------------------------------------------------------
 # LLM extraction prompt for shopping data
@@ -160,139 +131,11 @@ async def _detect_block(page) -> Optional[str]:
 # Core per-retailer crawl
 # ---------------------------------------------------------------------------
 
-async def _crawl_retailer(retailer_key: str, query: str) -> dict:
-    """Crawl a single retailer's search results for *query*."""
-    cfg = RETAILERS.get(retailer_key)
-    if not cfg:
-        return {"retailer": retailer_key, "status": "error", "error": "unknown_retailer"}
+async def _crawl_retailer(retailer_key: str, query: str, crawl_options: dict | None = None) -> dict:
+    """Crawl a single retailer's search results via tier_router."""
+    from tier_router import fetch_retailer
 
-    encoded = urllib.parse.quote_plus(query)
-    url = cfg["search_url"].format(query=encoded)
-    crawled_at = datetime.now(timezone.utc).isoformat()
-
-    if pool._browser is None:
-        return {"retailer": retailer_key, "status": "error", "error": "browser_pool_not_ready"}
-
-    try:
-        context_kwargs = get_stealth_context_kwargs()
-        context = await pool._browser.new_context(**context_kwargs)
-        page = await context.new_page()
-
-        try:
-            # Inject stealth JS before any navigation
-            await apply_stealth(page)
-
-                        # Warm up for sensitive retailers
-            if retailer_key in ("walmart", "target", "bestbuy"):
-                logger.info("[%s] Warming up session...", retailer_key)
-                base_url = "https://www." + retailer_key + ".com"
-                await page.goto(base_url, wait_until="domcontentloaded", timeout=20_000)
-                await _human_delay(1000, 2000)
-                await _dismiss_consent(page, cfg.get("consent_selectors", []))
-
-            logger.info("Shop crawl [%s] → %s", retailer_key, url)
-
-            # Navigate with a generous timeout
-            resp = await page.goto(url, wait_until="domcontentloaded", timeout=35_000)
-            http_status = resp.status if resp else None
-
-            # Initial human delay after page load
-            await _human_delay(1200, 2500)
-
-            # Dismiss cookie banners
-            await _dismiss_consent(page, cfg.get("consent_selectors", []))
-
-            # Check for blocks
-            block_reason = await _detect_block(page)
-            if block_reason in ("cloudflare_challenge", "captcha"):
-                # Wait extra for JS-rendered challenge to resolve
-                logger.warning("[%s] Challenge detected (%s), waiting 8s…", retailer_key, block_reason)
-                await page.wait_for_timeout(8_000)
-                block_reason = await _detect_block(page)
-
-            # Try to wait for product elements
-            try:
-                await page.wait_for_selector(
-                    cfg["wait_selector"],
-                    timeout=12_000,
-                    state="visible",
-                )
-            except Exception:
-                logger.debug("[%s] Product selector not found within timeout", retailer_key)
-
-            # Human-like scroll to load lazy images/prices
-            await _human_scroll(page)
-
-            # Re-check for block after JS has settled
-            final_block = await _detect_block(page)
-            if final_block in ("captcha", "access_denied", "blocked"):
-                return {
-                    "retailer": cfg["name"],
-                    "retailer_key": retailer_key,
-                    "query": query,
-                    "url": url,
-                    "status": "blocked",
-                    "block_reason": final_block,
-                    "http_status": http_status,
-                    "crawled_at": crawled_at,
-                }
-
-            # Extract visible text
-            raw_text = await page.inner_text("body")
-
-            # Light clean — collapse blanks, cap at 80K (plenty for product lists)
-            lines = raw_text.splitlines()
-            cleaned_lines = []
-            prev_blank = False
-            for line in lines:
-                s = line.strip()
-                blank = s == ""
-                if blank and prev_blank:
-                    continue
-                cleaned_lines.append(s)
-                prev_blank = blank
-            page_text = "\n".join(cleaned_lines)[:80_000]
-
-            char_count = len(page_text)
-            logger.info("[%s] Captured %d chars, http=%s", retailer_key, char_count, http_status)
-
-            return {
-                "retailer": cfg["name"],
-                "retailer_key": retailer_key,
-                "query": query,
-                "url": url,
-                "page_text": page_text,
-                "char_count": char_count,
-                "http_status": http_status,
-                "status": "ok",
-                "crawled_at": crawled_at,
-            }
-
-        finally:
-            await context.close()
-
-    except PlaywrightTimeout:
-        logger.warning("[%s] Timeout", retailer_key)
-        return {
-            "retailer": cfg["name"],
-            "retailer_key": retailer_key,
-            "query": query,
-            "url": url,
-            "status": "error",
-            "error": "timeout",
-            "crawled_at": crawled_at,
-        }
-    except Exception as exc:
-        logger.exception("[%s] Unexpected error", retailer_key)
-        return {
-            "retailer": cfg["name"],
-            "retailer_key": retailer_key,
-            "query": query,
-            "url": url,
-            "status": "error",
-            "error": str(exc),
-            "crawled_at": crawled_at,
-        }
+    return await fetch_retailer(retailer_key, query, crawl_options)
 
 
 # ---------------------------------------------------------------------------
@@ -304,9 +147,10 @@ async def _extract_shop_result(crawl: dict, query: str) -> dict:
     if crawl["status"] != "ok":
         return {**crawl, "data": None}
 
+    page_text = crawl.get("page_text") or crawl.get("text") or ""
     prompt = _SHOP_PROMPT_TEMPLATE.format(query=query)
     extracted = await extract_structured(
-        page_text=crawl["page_text"],
+        page_text=page_text,
         prompt=prompt,
         extra_context=f"Retailer: {crawl['retailer']}. Product search: {query}",
     )
@@ -338,6 +182,7 @@ async def search_product(
     retailers: Optional[list[str]] = None,
     max_concurrency: int = 1,
     google_fallback: bool = True,
+    crawl_options: dict | None = None,
 ) -> list[dict]:
     """
     Search for *query* across multiple retailers and return structured price data.
@@ -370,7 +215,7 @@ async def search_product(
 
     async def _run_one(rkey: str) -> dict:
         async with sem:
-            crawl = await _crawl_retailer(rkey, query)
+            crawl = await _crawl_retailer(rkey, query, crawl_options)
             return await _extract_shop_result(crawl, query)
 
     # Run direct retailer crawls + Google Shopping in parallel

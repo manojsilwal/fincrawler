@@ -74,70 +74,23 @@ async def _scroll_to_bottom(page: Page):
 # Public API
 # ---------------------------------------------------------------------------
 
-async def crawl_single(url: str) -> dict:
+async def crawl_single(url: str, crawl_options: dict | None = None) -> dict:
     """
-    Scrape a single URL.
+    Scrape a single URL via tier_router (escalates across tiers on block).
 
     Returns
     -------
     dict with keys:
-        url          str   — original URL
-        title        str   — <title> text
-        text         str   — cleaned visible text (≤50 k chars)
-        status       str   — "ok" | "error"
-        error        str   — only present on error
-        crawled_at   str   — ISO-8601 UTC timestamp
+        url, title, text, status, tier_used, tier_name, detection_hits, session_id, ...
     """
-    crawled_at = datetime.now(timezone.utc).isoformat()
+    from tier_router import fetch_url
 
-    try:
-        async with pool.acquire() as page:
-            logger.info("Crawling %s", url)
-
-            response = await page.goto(
-                url,
-                wait_until="domcontentloaded",
-                timeout=_NAV_TIMEOUT_MS,
-            )
-            http_status = response.status if response else None
-
-            # Scroll to trigger lazy-loaded content (charts, price tickers, etc.)
-            await _scroll_to_bottom(page)
-
-            title = await page.title()
-            raw_text = await page.inner_text("body")
-            text = _clean_text(raw_text)
-
-            char_count = len(text)
-            logger.info("Crawled %s — %d chars (%d chunks est.)", url, char_count, max(1, char_count // 12_000))
-            return {
-                "url": url,
-                "title": title,
-                "text": text,
-                "http_status": http_status,
-                "char_count": char_count,
-                "status": "ok",
-                "cache_hit": False,
-                "crawled_at": crawled_at,
-            }
-
-    except PlaywrightTimeout:
-        logger.warning("Timeout crawling %s", url)
-        return {
-            "url": url,
-            "status": "error",
-            "error": f"Page load timed out after {_NAV_TIMEOUT_MS // 1000}s",
-            "crawled_at": crawled_at,
-        }
-
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Unexpected error crawling %s", url)
-        return {
-            "url": url,
-            "status": "error",
-            "error": str(exc),
-            "crawled_at": crawled_at,
-        }
+    result = await fetch_url(url, crawl_options)
+    if result.get("status") == "ok" and "crawled_at" not in result:
+        result["crawled_at"] = datetime.now(timezone.utc).isoformat()
+    if result.get("status") == "ok":
+        result.setdefault("cache_hit", False)
+    return result
 
 
 async def crawl_parallel(urls: list[str], max_concurrency: int = 5) -> list[dict]:

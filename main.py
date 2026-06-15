@@ -124,6 +124,21 @@ class ScrapeRequest(BaseModel):
     url: str
     force_refresh: bool = False
     max_bytes: Optional[int] = None
+    # Tiered crawl envelope (see CONTRACT.md)
+    tier: Optional[int] = None
+    tier_name: Optional[str] = None
+    max_tier: int = 4
+    auto_escalate: bool = True
+    session_id: Optional[str] = None
+    warm_session: Optional[bool] = None
+    retailer_key: Optional[str] = None
+    fingerprint_profile: str = "chrome_mac_us"
+    behavior: Optional[dict[str, Any]] = None
+    proxy: Optional[dict[str, Any]] = None
+
+    def crawl_options(self) -> dict[str, Any]:
+        return self.model_dump(exclude={"url", "force_refresh"}, exclude_none=True)
+
 
 class ScrapeResponse(BaseModel):
     url: str
@@ -135,6 +150,11 @@ class ScrapeResponse(BaseModel):
     cache_hit: bool = False
     crawled_at: Optional[str] = None
     error: Optional[str] = None
+    tier_used: Optional[int] = None
+    tier_name: Optional[str] = None
+    detection_hits: Optional[list[str]] = None
+    block_reason: Optional[str] = None
+    session_id: Optional[str] = None
 
 
 class ExtractRequest(BaseModel):
@@ -179,6 +199,38 @@ class ShopSearchRequest(BaseModel):
             "for any retailer that blocks the direct crawl."
         ),
     )
+    tier: Optional[int] = None
+    tier_name: Optional[str] = None
+    max_tier: int = 4
+    auto_escalate: bool = True
+    session_id: Optional[str] = None
+    warm_session: Optional[bool] = None
+    retailer_key: Optional[str] = None
+    fingerprint_profile: str = "chrome_mac_us"
+    behavior: Optional[dict[str, Any]] = None
+    proxy: Optional[dict[str, Any]] = None
+
+    def crawl_options(self) -> dict[str, Any]:
+        return self.model_dump(
+            exclude={"query", "retailers", "max_concurrency", "google_fallback"},
+            exclude_none=True,
+        )
+
+
+class GoogleShopRequest(BaseModel):
+    tier: Optional[int] = None
+    tier_name: Optional[str] = None
+    max_tier: int = 4
+    auto_escalate: bool = True
+    session_id: Optional[str] = None
+    warm_session: Optional[bool] = None
+    retailer_key: str = "google_shopping"
+    fingerprint_profile: str = "chrome_mac_us"
+    behavior: Optional[dict[str, Any]] = None
+    proxy: Optional[dict[str, Any]] = None
+
+    def crawl_options(self) -> dict[str, Any]:
+        return self.model_dump(exclude_none=True)
 
 
 class ShopResultData(BaseModel):
@@ -208,6 +260,10 @@ class ShopRetailerResult(BaseModel):
     block_reason: Optional[str] = None
     error: Optional[str] = None
     crawled_at: Optional[str] = None
+    tier_used: Optional[int] = None
+    tier_name: Optional[str] = None
+    detection_hits: Optional[list[str]] = None
+    session_id: Optional[str] = None
 
 
 class ShopSearchResponse(BaseModel):
@@ -453,6 +509,7 @@ async def quote_smart(
 
 
 @app.post("/scrape", tags=["Crawler"], response_model=ScrapeResponse)
+@app.post("/crawl", tags=["Crawler"], response_model=ScrapeResponse)
 async def scrape(
     req: Optional[ScrapeRequest] = None,
     url: Optional[str] = None,
@@ -464,24 +521,32 @@ async def scrape(
     # Resolve parameters from body or query
     target_url = url
     refresh = force_refresh
+    crawl_opts: dict[str, Any] | None = None
     if req:
         target_url = req.url or target_url
         refresh = req.force_refresh or refresh
+        crawl_opts = req.crawl_options()
         
     if not target_url:
         raise HTTPException(status_code=400, detail="url is required.")
 
     # L1: cache check
-    if not force_refresh:
+    if not refresh:
         cached = await cache.get(target_url)
         if cached:
             return JSONResponse(content=cached)
 
-    # L2: live crawl
-    result = await crawl_single(target_url)
+    # L2: tiered crawl
+    result = await crawl_single(target_url, crawl_options=crawl_opts)
 
     if result["status"] == "ok":
         await cache.set(target_url, result)
+
+    # Zenith worker expects title/excerpt/status_code shape for /crawl path
+    if result.get("html") and not result.get("excerpt"):
+        result["excerpt"] = (result.get("text") or "")[:400]
+    if result.get("http_status") is not None and "status_code" not in result:
+        result["status_code"] = result["http_status"]
 
     return JSONResponse(
         content=result,
@@ -591,6 +656,7 @@ async def shop_search(
         retailers=req.retailers,
         max_concurrency=req.max_concurrency,
         google_fallback=req.google_fallback,
+        crawl_options=req.crawl_options(),
     )
 
     ok_count      = sum(1 for r in results if r.get("status") in ("ok", "ok_via_google"))
@@ -608,6 +674,7 @@ async def shop_search(
 @app.post("/shop/google", tags=["Shopping"])
 async def shop_google(
     query: str,
+    body: Optional[GoogleShopRequest] = None,
     x_api_key: str = Header(default=""),
 ):
     """
@@ -627,7 +694,8 @@ async def shop_google(
         raise HTTPException(status_code=400, detail="query is required")
 
     from google_shop import google_shop_search
-    result = await google_shop_search(query=query.strip())
+    crawl_opts = body.crawl_options() if body else None
+    result = await google_shop_search(query=query.strip(), crawl_options=crawl_opts)
 
     status_code = 200 if result.get("status") == "ok" else 502
     return JSONResponse(content=result, status_code=status_code)

@@ -1,0 +1,56 @@
+{
+  "amazon": {
+    "name": "Amazon",
+    "default_tier": 3,
+    "warm_session": true,
+    "homepage_url": "https://www.amazon.com",
+    "search_url": "https://www.amazon.com/s?k={query}&ref=nb_sb_noss",
+    "wait_selector": "#search, #s-results-list-atf, [data-component-type='s-search-result']",
+    "consent_selectors": ["#sp-cc-accept", "[data-cel-widget='sp-cc-accept']"]
+  },
+  "walmart": {
+    "name": "Walmart",
+    "default_tier": 3,
+    "warm_session": true,
+    "homepage_url": "https://www.walmart.com",
+    "search_url": "https://www.walmart.com/search?q={query}",
+    "wait_selector": "[data-automation-id='product-title'], .search-result-product-title",
+    "consent_selectors": ["[data-automation='close-cta']", "#onetrust-accept-btn-handler"]
+  },
+  "ebay": {
+    "name": "eBay",
+    "default_tier": 2,
+    "warm_session": false,
+    "homepage_url": "https://www.ebay.com",
+    "search_url": "https://www.ebay.com/sch/i.html?_nkw={query}&_sacat=0",
+    "wait_selector": ".s-item__title, #srp-river-results",
+    "consent_selectors": ["#gdpr-banner-accept", ".gh-consent-btn-accept"]
+  },
+  "bestbuy": {
+    "name": "Best Buy",
+    "default_tier": 2,
+    "warm_session": true,
+    "homepage_url": "https://www.bestbuy.com",
+    "search_url": "https://www.bestbuy.com/site/searchpage.jsp?st={query}",
+    "wait_selector": ".sku-title, .sr-only, .priceView-hero-price",
+    "consent_selectors": [".us-link", "#accept-cookie-btn"]
+  },
+  "target": {
+    "name": "Target",
+    "default_tier": 3,
+    "warm_session": true,
+    "homepage_url": "https://www.target.com",
+    "search_url": "https://www.target.com/s?searchTerm={query}",
+    "wait_selector": "[data-test='product-title'], .ProductCardVariantDefault-module__title",
+    "consent_selectors": ["#accept", "[data-test='age-verification-button']"]
+  },
+  "google_shopping": {
+    "name": "Google Shopping",
+    "default_tier": 3,
+    "warm_session": true,
+    "homepage_url": "https://www.google.com",
+    "search_url": "https://www.google.com/search?q={query}&tbm=shop&hl=en&gl=us",
+    "wait_selector": ".sh-dgr__content, .i0Xdpf, .pla-unit",
+    "consent_selectors": ["#L2AGLb", "button[aria-label='Accept all']"]
+  }
+}

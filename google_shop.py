@@ -217,6 +217,7 @@ async def _crawl_google_shopping(query: str) -> dict:
 async def google_shop_search(
     query: str,
     max_listings: int = 20,
+    crawl_options: dict | None = None,
 ) -> dict:
     """
     Search Google Shopping for *query* and return structured product listings.
@@ -241,7 +242,9 @@ async def google_shop_search(
         crawled_at       str
         error            str  (only on error)
     """
-    crawl = await _crawl_google_shopping(query)
+    from tier_router import fetch_retailer
+
+    crawl = await fetch_retailer("google_shopping", query, crawl_options)
 
     if crawl["status"] != "ok":
         return {
@@ -251,12 +254,17 @@ async def google_shop_search(
             "url": crawl.get("url", ""),
             "listings": [],
             "total_listings": 0,
-            "error": crawl.get("error", "crawl_failed"),
+            "error": crawl.get("error", crawl.get("block_reason", "crawl_failed")),
+            "tier_used": crawl.get("tier_used"),
+            "tier_name": crawl.get("tier_name"),
+            "detection_hits": crawl.get("detection_hits", []),
+            "session_id": crawl.get("session_id"),
         }
 
+    page_text = crawl.get("page_text") or crawl.get("text") or ""
     prompt = _GOOGLE_SHOP_PROMPT.format(query=query)
     extracted = await extract_structured(
-        page_text=crawl["page_text"],
+        page_text=page_text,
         prompt=prompt,
         extra_context=f"Product search query: {query}",
     )
@@ -285,6 +293,10 @@ async def google_shop_search(
         "total_listings": len(listings),
         "char_count": crawl.get("char_count", 0),
         "crawled_at": crawl.get("crawled_at", ""),
+        "tier_used": crawl.get("tier_used"),
+        "tier_name": crawl.get("tier_name"),
+        "detection_hits": crawl.get("detection_hits", []),
+        "session_id": crawl.get("session_id"),
     }
 
 
