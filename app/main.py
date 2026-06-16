@@ -8,7 +8,8 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import asp, crawl_jobs, health, legacy, products, rankings, shop, sources, zenith_compat
+from app.api import asp, crawl_jobs, finance_compat, health, products, rankings, shop, sources, zenith_compat
+from firecrawl_compat import router as firecrawl_router
 from app.config import get_settings
 from app.database import init_db
 
@@ -72,4 +73,5 @@ app.include_router(products.router)
 app.include_router(rankings.router)
 app.include_router(shop.router)
 app.include_router(zenith_compat.router)
-app.include_router(legacy.router)
+app.include_router(finance_compat.router)
+app.include_router(firecrawl_router)

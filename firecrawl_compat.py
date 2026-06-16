@@ -62,8 +62,12 @@ async def firecrawl_scrape_endpoint(
     if cached:
         result = cached
     else:
-        # 2. Live crawl
-        result = await crawl_single(url)
+        # 2. Tier-1 HTTP fetch (no browser pool required)
+        from app.services.crawler.compliant_fetcher import fetch_compliant
+
+        result = await fetch_compliant(url)
+        if result.get("status") != "ok":
+            result = await crawl_single(url)
         if result.get("status") == "ok":
             await cache.set(url, result)
 
@@ -77,8 +81,8 @@ async def firecrawl_scrape_endpoint(
     return {
         "success": True,
         "data": {
-            "markdown": result.get("text", ""),
-            "content": result.get("text", ""),
+            "markdown": result.get("text") or result.get("page_text") or "",
+            "content": result.get("text") or result.get("page_text") or "",
             "metadata": {
                 "title": result.get("title", ""),
                 "sourceURL": result.get("url", url),
