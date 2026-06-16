@@ -12,8 +12,6 @@ from datetime import datetime, timezone
 
 from playwright.async_api import Page, TimeoutError as PlaywrightTimeout
 
-from browser_pool import pool
-
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
