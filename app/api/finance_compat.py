@@ -251,10 +251,54 @@ async def sec_filing(
     return {"ticker": sym, "form": form, "text": text[:12_000], "content": text[:12_000]}
 
 
+@router.get("/fetch/html")
+async def fetch_html(
+    url: str,
+    force_refresh: bool = False,
+    _: None = Depends(_auth),
+):
+    """Fast Tier-1 HTML fetch (httpx). Used by TradeTalk for Slickcharts tables."""
+    target_url = (url or "").strip()
+    if not target_url:
+        raise HTTPException(status_code=400, detail="url is required")
+
+    from cache import cache
+    from app.services.crawler.compliant_fetcher import fetch_compliant
+
+    cache_key = f"html:{target_url}"
+    if not force_refresh:
+        cached = await cache.get(cache_key)
+        if cached and cached.get("status") == "ok" and cached.get("html"):
+            return {
+                "ok": True,
+                "url": cached.get("url", target_url),
+                "html": cached.get("html", ""),
+                "http_status": cached.get("http_status"),
+                "cache_hit": True,
+            }
+
+    result = await fetch_compliant(target_url)
+    if result.get("status") != "ok":
+        err = result.get("error") or "fetch_failed"
+        raise HTTPException(status_code=502, detail=err)
+
+    if not force_refresh:
+        await cache.set(cache_key, result)
+
+    return {
+        "ok": True,
+        "url": result.get("url", target_url),
+        "html": result.get("html") or "",
+        "http_status": result.get("http_status"),
+        "cache_hit": False,
+    }
+
+
 @router.post("/scrape")
 @router.post("/crawl")
 async def scrape_compat(req: ScrapeRequest, _: None = Depends(_auth)):
     from cache import cache
+    from app.services.crawler.compliant_fetcher import fetch_compliant
     from crawler import crawl_single
 
     target_url = (req.url or "").strip()
@@ -266,7 +310,9 @@ async def scrape_compat(req: ScrapeRequest, _: None = Depends(_auth)):
         if cached:
             return cached
 
-    result = await crawl_single(target_url)
+    result = await fetch_compliant(target_url)
+    if result.get("status") != "ok":
+        result = await crawl_single(target_url)
     if result.get("status") == "ok":
         await cache.set(target_url, result)
     if result.get("html") and not result.get("excerpt"):
