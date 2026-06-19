@@ -122,6 +122,14 @@ class AspEngine:
                     return self._finalize(last, attempts)
                 await record_failure("js_browser", error=last.get("block_reason"))
 
+        from app.services.crawler.vision_fetcher import maybe_apply_vision_fallback
+
+        last = await maybe_apply_vision_fallback(
+            last,
+            url,
+            retailer_key=retailer_key,
+            task="shopping" if retailer_key else "finance",
+        )
         last["asp_attempts"] = attempts
         last["service"] = self.service_name
         return last

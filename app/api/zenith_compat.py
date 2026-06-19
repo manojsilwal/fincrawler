@@ -51,8 +51,22 @@ async def crawl_compat(body: CrawlRequest, db: Session = Depends(get_db), _: Non
         raise HTTPException(400, "no active source configured")
 
     result = await hybrid_router.fetch(db, source, body.url)
+    from app.services.asp.detector import is_usable_scrape
+    from app.services.crawler.vision_fetcher import maybe_apply_vision_fallback, vision_fallback_enabled
+
+    retailer_key = body.retailer_key or (source.retailer_key if source else "")
+    if vision_fallback_enabled():
+        needs_vision = result.get("status") != "ok" or not is_usable_scrape(result, retailer_key)
+        if needs_vision:
+            result = await maybe_apply_vision_fallback(
+                result,
+                body.url,
+                retailer_key=retailer_key,
+                task="shopping" if retailer_key else "finance",
+            )
+
     html = result.get("html") or result.get("text") or ""
-    return {
+    payload = {
         "url": result.get("url", body.url),
         "status_code": result.get("http_status"),
         "title": result.get("title"),
@@ -65,3 +79,8 @@ async def crawl_compat(body: CrawlRequest, db: Session = Depends(get_db), _: Non
         "detection_hits": result.get("detection_hits", []),
         "escalated_from": result.get("escalated_from"),
     }
+    if result.get("vision_data"):
+        payload["vision_data"] = result["vision_data"]
+        payload["vision_fallback"] = True
+        payload["vision_source"] = result.get("vision_source")
+    return payload

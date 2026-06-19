@@ -418,13 +418,27 @@ async def scrape_compat(req: ScrapeRequest, _: None = Depends(_auth)):
     result = await fetch_compliant(target_url)
     if result.get("status") != "ok":
         result = await crawl_single(target_url)
+
+    from app.services.crawler.vision_fetcher import maybe_apply_vision_fallback, vision_fallback_enabled
+
+    if vision_fallback_enabled():
+        result = await maybe_apply_vision_fallback(
+            result if isinstance(result, dict) else {"status": "error", "url": target_url},
+            target_url,
+            task="finance",
+        )
+
     if result.get("status") == "ok":
         await cache.set(target_url, result)
     if result.get("html") and not result.get("excerpt"):
         result["excerpt"] = (result.get("text") or "")[:400]
+    if result.get("vision_data") and not result.get("excerpt"):
+        import json as _json
+
+        result["excerpt"] = _json.dumps(result["vision_data"])[:2000]
     if result.get("http_status") is not None and "status_code" not in result:
         result["status_code"] = result["http_status"]
-    if result.get("status") != "ok":
+    if result.get("status") != "ok" and not result.get("vision_data"):
         raise HTTPException(status_code=502, detail=result.get("error") or "scrape_failed")
     return result
 

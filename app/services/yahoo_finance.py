@@ -311,7 +311,9 @@ def _yahoo_api_succeeded(modules: dict[str, Any]) -> bool:
 
 
 def _vision_fallback_enabled() -> bool:
-    return os.getenv("VISION_FALLBACK_ENABLED", "true").lower() not in ("0", "false", "no")
+    from app.services.crawler.vision_fetcher import vision_fallback_enabled
+
+    return vision_fallback_enabled()
 
 
 def _merge_flat_with_vision(flat: dict[str, Any], vision_flat: dict[str, Any]) -> dict[str, Any]:
@@ -467,79 +469,31 @@ async def fetch_yahoo_via_screenshot(ticker: str) -> dict[str, Any]:
     Last-resort path: scroll Playwright page → multiple viewport PNGs → vision LLM.
     Works when HTML/API miss hydrated SPA content or APIs rate-limit.
     """
-    from app.config import get_settings
-    from app.services.asp.profiles import get_retailer_profile
-    from app.services.crawler.browser_pool import get_browser_pool
-    from app.services.crawler.human_behavior import dismiss_consent, run_behavior
-    from app.services.crawler.screenshot_capture import capture_scrolled_screenshots
-    from llm import extract_from_screenshots
+    from app.services.crawler.vision_fetcher import vision_extract_page
 
     sym = ticker.upper().strip()
     page_url = f"https://finance.yahoo.com/quote/{sym}/"
-    profile = get_retailer_profile(YAHOO_RETAILER_KEY)
-    settings = get_settings()
-    meta: dict[str, Any] = {"path": "screenshot_vision_scroll"}
 
-    pool = await get_browser_pool(size=settings.browser_pool_size)
-    async with pool.page(retailer_key=YAHOO_RETAILER_KEY) as (page, _ctx):
-        await page.goto(page_url, wait_until="domcontentloaded", timeout=settings.browser_nav_timeout_ms)
-        await page.wait_for_timeout(1500)
-        await dismiss_consent(page, profile.get("consent_selectors", []))
-        wait_sel = profile.get("wait_selector")
-        if wait_sel:
-            try:
-                await page.wait_for_selector(wait_sel, timeout=10_000, state="visible")
-            except Exception:
-                pass
-        await page.wait_for_timeout(int(profile.get("hydration_wait_ms") or 6000))
-        await run_behavior(page)
-
-        shots = await capture_scrolled_screenshots(page)
-        meta["screenshot_count"] = len(shots)
-        meta["screenshot_bytes"] = sum(s["bytes"] for s in shots)
-        meta["screenshot_scroll_ys"] = [s["scroll_y"] for s in shots]
-        images = [s["png"] for s in shots]
-
-    extracted = await extract_from_screenshots(
-        images,
-        _YAHOO_VISION_PROMPT,
-        extra_context=f"Ticker: {sym}. URL: {page_url}. {len(images)} scroll panels.",
+    vision = await vision_extract_page(
+        page_url,
+        retailer_key=YAHOO_RETAILER_KEY,
+        prompt=_YAHOO_VISION_PROMPT,
+        task="finance",
+        extra_context=f"Ticker: {sym}.",
+        field_aliases=[
+            ("quote_header.regularMarketPrice", "vision.regularMarketPrice"),
+            ("regularMarketPrice", "vision.regularMarketPrice"),
+            ("quote_header.ticker", "vision.ticker"),
+            ("ticker", "vision.ticker"),
+        ],
     )
-
-    flat: dict[str, Any] = {}
-    for k, v in extracted.items():
-        if str(k).startswith("_") or k == "news":
-            continue
-        if isinstance(v, dict):
-            for sub_k, sub_v in v.items():
-                if sub_v is not None:
-                    flat[f"vision.{k}.{sub_k}"] = sub_v
-        else:
-            flat[f"vision.{k}"] = v
-
-    flat = _strip_news_from_flat(flat)
-
-    # Promote common quote fields to top-level vision.* keys for price detection
-    for alias in (
-        ("quote_header.regularMarketPrice", "vision.regularMarketPrice"),
-        ("regularMarketPrice", "vision.regularMarketPrice"),
-        ("quote_header.ticker", "vision.ticker"),
-        ("ticker", "vision.ticker"),
-    ):
-        src, dst = alias
-        if dst not in flat:
-            if src in flat:
-                flat[dst] = flat[src]
-            elif "." in src:
-                section, field = src.split(".", 1)
-                nested = extracted.get(section)
-                if isinstance(nested, dict) and nested.get(field) is not None:
-                    flat[dst] = nested[field]
+    flat = _strip_news_from_flat(vision.get("flat") or {})
+    extracted = vision.get("extracted") or {}
 
     return {
         "flat": flat,
         "source": "yahoo_screenshot_vision" if flat and "_error" not in extracted else "yahoo_screenshot_failed",
-        "meta": {**meta, "vision_error": extracted.get("_error")},
+        "meta": {**(vision.get("meta") or {}), "vision_error": extracted.get("_error")},
     }
 
 

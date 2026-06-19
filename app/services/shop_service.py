@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from app.services.crawler.html_product_extractor import extract_product_fields
 from app.services.crawler.hybrid_router import hybrid_router
+from app.services.crawler.vision_fetcher import shopping_vision_has_signal, vision_extract_shopping, vision_fallback_enabled
 from app.services.matching.product_matcher import ProductMatcher
 from app.services.normalization.product_normalizer import ProductNormalizer
 from app.services.ranking.product_ranker import ProductRanker
@@ -54,9 +55,20 @@ async def _extract_with_llm(crawl: dict, query: str, retailer_key: str) -> dict:
     merged = merge_shop_extraction(extracted, candidates, query=query, retailer_key=retailer_key)
     if merged.get("price") or merged.get("product_name"):
         return merged
-    fields = extract_product_fields(html, page_text)
-    if fields.get("_error"):
-        return merged
+    if fields.get("_error") or not (fields.get("price") or fields.get("title")):
+        if vision_fallback_enabled() and crawl.get("url"):
+            vision = await vision_extract_shopping(
+                crawl.get("url") or "",
+                query=query,
+                retailer_key=retailer_key,
+                candidates=candidates,
+            )
+            if shopping_vision_has_signal(vision.get("data") or {}):
+                out = dict(vision["data"])
+                out["price_source"] = "vision"
+                return out
+        if fields.get("_error"):
+            return merged
     return {
         "product_name": fields.get("title"),
         "price": fields.get("price"),
@@ -131,10 +143,40 @@ async def _run_one(db: Session, retailer_key: str, query: str) -> dict:
     crawl["query"] = query
 
     if crawl.get("status") != "ok":
+        if vision_fallback_enabled():
+            vision = await vision_extract_shopping(url, query=query, retailer_key=retailer_key)
+            if shopping_vision_has_signal(vision.get("data") or {}):
+                data = vision["data"]
+                norm = _normalizer.normalize({**data, "title": data.get("product_name")})
+                match = _matcher.find_or_create_product(db, norm)
+                _persist_offer(db, source, match["product_id"], data, crawl)
+                result = {k: v for k, v in crawl.items() if k not in ("html", "page_text", "text")}
+                result["data"] = data
+                result["llm_extraction"] = True
+                result["product_id"] = str(match["product_id"])
+                result["vision_fallback"] = True
+                result["status"] = "ok"
+                return result
         return {
             **{k: v for k, v in crawl.items() if k not in ("html", "page_text", "text")},
             "data": None,
         }
+
+    from app.services.asp.detector import is_usable_scrape
+
+    if vision_fallback_enabled() and not is_usable_scrape(crawl, retailer_key):
+        vision = await vision_extract_shopping(url, query=query, retailer_key=retailer_key)
+        if shopping_vision_has_signal(vision.get("data") or {}):
+            data = vision["data"]
+            norm = _normalizer.normalize({**data, "title": data.get("product_name")})
+            match = _matcher.find_or_create_product(db, norm)
+            _persist_offer(db, source, match["product_id"], data, crawl)
+            result = {k: v for k, v in crawl.items() if k not in ("html", "page_text", "text")}
+            result["data"] = data
+            result["llm_extraction"] = True
+            result["product_id"] = str(match["product_id"])
+            result["vision_fallback"] = True
+            return result
 
     data = await _extract_with_llm(crawl, query, retailer_key)
     norm = _normalizer.normalize({**data, "title": data.get("product_name")})
