@@ -217,6 +217,11 @@ async def _fetch_stealth_browser_once(
                 except Exception:
                     logger.debug("Failed to persist antibot cookies for %s", retailer_key, exc_info=True)
 
+            try:
+                base["cookies"] = {c["name"]: c["value"] for c in await context.cookies()}
+            except Exception:
+                pass
+
             return {**base, "status": "ok"}
     except PlaywrightTimeout:
         return {

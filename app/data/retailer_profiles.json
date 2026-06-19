@@ -56,5 +56,27 @@
     "scroll_wait_ms": 12000,
     "hydration_wait_ms": 3000,
     "extra_scroll": true
+  },
+  "yahoo_finance": {
+    "name": "Yahoo Finance",
+    "default_tier": 4,
+    "warm_session": true,
+    "homepage_url": "https://finance.yahoo.com",
+    "wait_selector": "[data-test='qsp-price'], fin-streamer[data-field='regularMarketPrice'][value]",
+    "consent_selectors": [
+      "button[name='agree']",
+      "button.accept-all",
+      "#consent-page button[type='submit']",
+      "[data-test='accept-all']"
+    ],
+    "product_markers": [
+      "data-test=\"qsp-price\"",
+      "fin-streamer[data-field=\"regularMarketPrice\"][value",
+      "quote-header-info"
+    ],
+    "min_usable_chars": 12000,
+    "hydration_wait_ms": 6000,
+    "scroll_wait_ms": 3000,
+    "extra_scroll": true
   }
 }

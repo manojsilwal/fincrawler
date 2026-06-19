@@ -95,6 +95,151 @@ def _message_text(message) -> str:
     return content
 
 
+async def extract_from_screenshot(
+    image_png: bytes,
+    prompt: str,
+    *,
+    extra_context: Optional[str] = None,
+    task: str = "finance",
+) -> dict:
+    """Vision fallback for a single screenshot."""
+    return await extract_from_screenshots(
+        [image_png],
+        prompt,
+        extra_context=extra_context,
+        task=task,
+    )
+
+
+def _merge_vision_dicts(parts: list[dict]) -> dict:
+    """Merge partial vision extractions; first non-null wins, lists are deduped."""
+    merged: dict = {}
+    for part in parts:
+        if not part or part.get("_error"):
+            continue
+        for key, val in part.items():
+            if str(key).startswith("_") or val is None:
+                continue
+            if key not in merged or merged[key] is None:
+                merged[key] = val
+                continue
+            existing = merged[key]
+            if isinstance(val, list) and isinstance(existing, list):
+                seen: set[str] = set()
+                combined: list = []
+                for item in existing + val:
+                    sig = json.dumps(item, sort_keys=True, default=str) if isinstance(item, dict) else str(item)
+                    if sig in seen:
+                        continue
+                    seen.add(sig)
+                    combined.append(item)
+                merged[key] = combined
+            elif isinstance(val, dict) and isinstance(existing, dict):
+                merged[key] = _merge_vision_dicts([existing, val])
+    return merged
+
+
+async def extract_from_screenshots(
+    images: list[bytes],
+    prompt: str,
+    *,
+    extra_context: Optional[str] = None,
+    task: str = "finance",
+) -> dict:
+    """
+    Vision fallback: extract structured data from one or more page screenshots.
+    Multiple images should be sequential viewport panels (top-to-bottom scroll).
+    """
+    import base64
+
+    if not images:
+        return {"_error": "no screenshots provided", "_llm_raw": None}
+
+    client = _get_client()
+    model = os.getenv("VISION_LLM_MODEL", "") or os.getenv("LLM_VISION_MODEL", "")
+    if not model:
+        model = os.getenv("LLM_MODEL", "") or _MODEL
+        if os.getenv("LLM_BASE_URL", "").find("openrouter") >= 0 and model == _MODEL:
+            model = "google/gemini-3.5-flash"
+
+    batch_size = int(os.getenv("VISION_SCREENSHOTS_PER_BATCH", "6"))
+    if len(images) <= batch_size:
+        batches = [images]
+        batch_offsets = [0]
+    else:
+        batches = [images[i : i + batch_size] for i in range(0, len(images), batch_size)]
+        batch_offsets = list(range(0, len(images), batch_size))
+
+    system_content = _SHOP_SYSTEM_PROMPT if task == "shopping" else _SYSTEM_PROMPT
+    if extra_context:
+        system_content += f"\n\nAdditional context: {extra_context}"
+    system_content += (
+        "\n\nYou are reading sequential viewport screenshots of the same web page "
+        "scrolled from top to bottom. Merge all visible data into one JSON object. "
+        "Extract only values clearly visible. Return JSON only."
+    )
+
+    partials: list[dict] = []
+    for batch_idx, batch in enumerate(batches):
+        offset = batch_offsets[batch_idx]
+        panel_range = f"panels {offset + 1}-{offset + len(batch)} of {len(images)}"
+        user_content: list[dict] = [
+            {
+                "type": "text",
+                "text": (
+                    f"Instruction: {prompt}\n\n"
+                    f"These are {panel_range} (top to bottom). "
+                    "Combine data from all images; do not duplicate list items."
+                ),
+            },
+        ]
+        for i, img in enumerate(batch):
+            b64 = base64.standard_b64encode(img).decode("ascii")
+            user_content.append(
+                {
+                    "type": "text",
+                    "text": f"Screenshot panel {offset + i + 1}/{len(images)}:",
+                }
+            )
+            user_content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{b64}"},
+                }
+            )
+
+        try:
+            async with _llm_semaphore:
+                response = await client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": system_content},
+                        {"role": "user", "content": user_content},
+                    ],
+                    temperature=_TEMPERATURE,
+                    max_tokens=_MAX_TOKENS,
+                )
+            raw = _message_text(response.choices[0].message)
+            logger.info(
+                "Vision LLM extract | model=%s panels=%s response_chars=%d",
+                model,
+                panel_range,
+                len(raw),
+            )
+            partials.append(_parse_json_response(raw))
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Vision LLM extraction failed for %s", panel_range)
+            partials.append({"_error": str(exc), "_llm_raw": None})
+
+    if len(partials) == 1:
+        return partials[0]
+    merged = _merge_vision_dicts(partials)
+    errors = [p.get("_error") for p in partials if p.get("_error")]
+    if errors and not merged:
+        merged["_error"] = "; ".join(str(e) for e in errors)
+    return merged
+
+
 async def extract_structured(
     page_text: str,
     prompt: str,

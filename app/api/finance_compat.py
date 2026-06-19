@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -62,30 +63,33 @@ class SmartQuoteResponse(BaseModel):
     error: Optional[str] = None
 
 
+class FullQuoteResponse(BaseModel):
+    ok: bool
+    ticker: str
+    url: str = ""
+    source: str = ""
+    cache_hit: bool = False
+    field_count: int = 0
+    modules_fetched: list[str] = Field(default_factory=list)
+    data: dict[str, Any] = Field(default_factory=dict)
+    error: Optional[str] = None
+
+
+class FinanceScrapeRequest(BaseModel):
+    url: str
+    force_refresh: bool = False
+    include_html: bool = False
+
+
 class ScrapeRequest(BaseModel):
     url: str
     force_refresh: bool = False
 
 
-def _parse_yahoo_regular_price(page_text: str) -> Optional[float]:
-    if not page_text:
-        return None
-    patterns = (
-        r'"regularMarketPrice"\s*:\s*\{\s*"raw"\s*:\s*([0-9]+(?:\.[0-9]+)?)',
-        r'"regularMarketPrice"\s*:\s*([0-9]+(?:\.[0-9]+)?)',
-        r'"currentPrice"\s*:\s*\{\s*"raw"\s*:\s*([0-9]+(?:\.[0-9]+)?)',
-        r'"postMarketPrice"\s*:\s*\{\s*"raw"\s*:\s*([0-9]+(?:\.[0-9]+)?)',
-        r'"preMarketPrice"\s*:\s*\{\s*"raw"\s*:\s*([0-9]+(?:\.[0-9]+)?)',
-    )
-    for pat in patterns:
-        m = re.search(pat, page_text)
-        if m:
-            try:
-                v = float(m.group(1))
-                return v if v > 0 else None
-            except ValueError:
-                continue
-    return None
+def _parse_yahoo_regular_price(page_text: str, symbol: str | None = None) -> Optional[float]:
+    from app.services.yahoo_finance import parse_yahoo_regular_price
+
+    return parse_yahoo_regular_price(page_text, symbol)
 
 
 async def _fetch_page_text(url: str) -> tuple[str, Optional[str]]:
@@ -109,57 +113,38 @@ async def _fetch_page_text(url: str) -> tuple[str, Optional[str]]:
         return "", str(exc)
 
 
-async def _fetch_yahoo_quote_price(url: str) -> tuple[Optional[float], Optional[str]]:
+async def _fetch_yahoo_quote_price(url: str, symbol: str | None = None) -> tuple[Optional[float], Optional[str]]:
+    from app.services.yahoo_finance import fetch_yahoo_full, ticker_from_yahoo_url
+
+    sym = symbol or ticker_from_yahoo_url(url)
+    if sym:
+        full = await fetch_yahoo_full(sym)
+        data = full.get("data") or {}
+        for key in (
+            "price.regularMarketPrice",
+            "asp.regularMarketPrice",
+            "dom.regularMarketPrice",
+            "vision.regularMarketPrice",
+            "regularMarketPrice",
+            "html.regularMarketPrice",
+        ):
+            val = data.get(key)
+            if isinstance(val, (int, float)) and val > 0:
+                return float(val), None
+
     html, err = await _fetch_page_text(url)
     if err and not html:
         return None, err
-    price = _parse_yahoo_regular_price(html)
+    price = _parse_yahoo_regular_price(html, sym)
     if price is not None:
         return price, None
     return None, err
 
 
 def _parse_news_articles(html: str, limit: int) -> list[dict[str, str]]:
-    articles: list[dict[str, str]] = []
-    seen: set[str] = set()
-    for m in re.finditer(
-        r'<a[^>]+href="([^"]+)"[^>]*>[\s\S]{0,200}?<h3[^>]*>([^<]{8,240})</h3>',
-        html,
-        re.I,
-    ):
-        link, title = m.group(1).strip(), re.sub(r"\s+", " ", m.group(2)).strip()
-        if title in seen:
-            continue
-        seen.add(title)
-        articles.append(
-            {
-                "title": title,
-                "summary": "",
-                "link": link,
-                "publisher": "Yahoo Finance",
-            }
-        )
-        if len(articles) >= limit:
-            break
-    if articles:
-        return articles
+    from app.services.yahoo_finance import parse_news_articles_from_html
 
-    for m in re.finditer(r"<h3[^>]*>([^<]{12,240})</h3>", html, re.I):
-        title = re.sub(r"\s+", " ", m.group(1)).strip()
-        if title in seen:
-            continue
-        seen.add(title)
-        articles.append(
-            {
-                "title": title,
-                "summary": "",
-                "link": "",
-                "publisher": "Yahoo Finance",
-            }
-        )
-        if len(articles) >= limit:
-            break
-    return articles
+    return parse_news_articles_from_html(html, limit=limit)
 
 
 @router.get("/quote", response_model=QuoteResponse)
@@ -187,15 +172,53 @@ async def quote_smart(
     if not sym:
         raise HTTPException(status_code=400, detail="ticker is required")
 
-    from extractor import extract_quote
+    from app.services.yahoo_finance import fetch_yahoo_full
 
-    result = await extract_quote(ticker=sym, force_refresh=force_refresh)
-    if result.get("status") == "error":
+    result = await fetch_yahoo_full(sym, force_refresh=force_refresh)
+    if not result.get("ok"):
         raise HTTPException(status_code=502, detail=result.get("error", "extraction_failed"))
 
-    raw_data = result.get("data", {})
+    raw = result.get("data") or {}
+    mapped = {
+        "regularMarketPrice": (
+            raw.get("price.regularMarketPrice")
+            or raw.get("vision.regularMarketPrice")
+            or raw.get("vision.quote_header.regularMarketPrice")
+            or raw.get("asp.regularMarketPrice")
+            or raw.get("html.regularMarketPrice")
+        ),
+        "regularMarketChangePercent": (
+            raw.get("price.regularMarketChangePercent")
+            or raw.get("vision.quote_header.regularMarketChangePercent")
+            or raw.get("asp.regularMarketChangePercent")
+            or raw.get("html.regularMarketChangePercent")
+        ),
+        "regularMarketVolume": (
+            raw.get("price.regularMarketVolume")
+            or raw.get("vision.quote_header.regularMarketVolume")
+            or raw.get("asp.regularMarketVolume")
+            or raw.get("html.regularMarketVolume")
+        ),
+        "fiftyTwoWeekHigh": (
+            raw.get("summaryDetail.fiftyTwoWeekHigh")
+            or raw.get("vision.quote_header.fiftyTwoWeekHigh")
+            or raw.get("asp.fiftyTwoWeekHigh")
+        ),
+        "fiftyTwoWeekLow": (
+            raw.get("summaryDetail.fiftyTwoWeekLow")
+            or raw.get("vision.quote_header.fiftyTwoWeekLow")
+            or raw.get("asp.fiftyTwoWeekLow")
+        ),
+        "trailingPE": (
+            raw.get("summaryDetail.trailingPE")
+            or raw.get("defaultKeyStatistics.trailingPE")
+            or raw.get("asp.trailingPE")
+        ),
+        "marketCap": raw.get("summaryDetail.marketCap") or raw.get("asp.marketCap"),
+        "shortName": raw.get("price.shortName") or raw.get("asp.shortName") or raw.get("html.shortName"),
+    }
     try:
-        quote_data = SmartQuoteData.model_validate(raw_data)
+        quote_data = SmartQuoteData.model_validate(mapped)
     except Exception:
         quote_data = None
 
@@ -204,27 +227,89 @@ async def quote_smart(
         ticker=sym,
         data=quote_data,
         cache_hit=result.get("cache_hit", False),
-        chunks_used=result.get("chunks_used", 0),
-        total_chunks=result.get("total_chunks", 0),
+        chunks_used=len(result.get("modules_fetched") or []),
+        total_chunks=len(result.get("modules_fetched") or []),
     )
+
+
+@router.get("/quote/full", response_model=FullQuoteResponse)
+async def quote_full(
+    ticker: str = "",
+    url: str = "",
+    force_refresh: bool = False,
+    include_html: bool = False,
+    _: None = Depends(_auth),
+):
+    """Fetch Yahoo Finance quote data. Use GET /news for headlines."""
+    from app.services.yahoo_finance import fetch_yahoo_full, ticker_from_yahoo_url
+
+    sym = (ticker or "").upper().strip() or ticker_from_yahoo_url(url or "")
+    if not sym:
+        raise HTTPException(status_code=400, detail="ticker or finance.yahoo.com quote url is required")
+
+    result = await fetch_yahoo_full(
+        sym,
+        force_refresh=force_refresh,
+        include_html=include_html,
+    )
+    if not result.get("ok"):
+        raise HTTPException(status_code=502, detail=result.get("error", "yahoo_fetch_failed"))
+
+    payload = {k: result.get(k) for k in FullQuoteResponse.model_fields if k in result}
+    if include_html and result.get("html"):
+        payload["html"] = result["html"]
+    return FullQuoteResponse(**payload)
+
+
+@router.post("/finance/scrape")
+async def finance_scrape(req: FinanceScrapeRequest, _: None = Depends(_auth)):
+    """Scrape all structured data from a Yahoo Finance quote page URL."""
+    from app.services.yahoo_finance import fetch_yahoo_full, is_yahoo_quote_url, ticker_from_yahoo_url
+
+    target = (req.url or "").strip()
+    if not target:
+        raise HTTPException(status_code=400, detail="url is required")
+    if not is_yahoo_quote_url(target):
+        raise HTTPException(status_code=400, detail="url must be a finance.yahoo.com/quote/... page")
+
+    sym = ticker_from_yahoo_url(target)
+    if not sym:
+        raise HTTPException(status_code=400, detail="could not parse ticker from url")
+
+    result = await fetch_yahoo_full(
+        sym,
+        force_refresh=req.force_refresh,
+        include_html=req.include_html,
+    )
+    if not result.get("ok"):
+        raise HTTPException(status_code=502, detail=result.get("error", "yahoo_fetch_failed"))
+    return result
 
 
 @router.get("/news")
 async def stock_news(
     ticker: str,
     limit: int = 8,
+    force_refresh: bool = False,
     _: None = Depends(_auth),
 ):
     sym = (ticker or "").upper().strip()
     if not sym:
         raise HTTPException(status_code=400, detail="ticker is required")
     limit = max(1, min(limit, 25))
-    url = f"https://finance.yahoo.com/quote/{sym}/news"
-    html, err = await _fetch_page_text(url)
-    if err and not html:
-        raise HTTPException(status_code=502, detail=err)
-    articles = _parse_news_articles(html, limit)
-    return {"ticker": sym, "articles": articles, "count": len(articles)}
+
+    from app.services.yahoo_finance import fetch_yahoo_news
+
+    result = await fetch_yahoo_news(sym, limit=limit, force_refresh=force_refresh)
+    if not result.get("ok"):
+        raise HTTPException(status_code=502, detail=result.get("error", "news_fetch_failed"))
+    return {
+        "ticker": sym,
+        "articles": result.get("articles") or [],
+        "count": result.get("count", 0),
+        "source": result.get("source"),
+        "cache_hit": result.get("cache_hit", False),
+    }
 
 
 @router.get("/sec")
@@ -299,11 +384,31 @@ async def fetch_html(
 async def scrape_compat(req: ScrapeRequest, _: None = Depends(_auth)):
     from cache import cache
     from app.services.crawler.compliant_fetcher import fetch_compliant
+    from app.services.yahoo_finance import fetch_yahoo_full, is_yahoo_quote_url, ticker_from_yahoo_url
     from crawler import crawl_single
 
     target_url = (req.url or "").strip()
     if not target_url:
         raise HTTPException(status_code=400, detail="url is required")
+
+    # Yahoo Finance quote pages: return structured data (not just HTML shell).
+    if is_yahoo_quote_url(target_url):
+        sym = ticker_from_yahoo_url(target_url)
+        if sym:
+            yahoo = await fetch_yahoo_full(sym, force_refresh=req.force_refresh)
+            if yahoo.get("ok"):
+                return {
+                    "url": target_url,
+                    "status": "ok",
+                    "status_code": 200,
+                    "title": yahoo.get("data", {}).get("price.shortName") or sym,
+                    "ticker": sym,
+                    "source": yahoo.get("source"),
+                    "field_count": yahoo.get("field_count", 0),
+                    "modules_fetched": yahoo.get("modules_fetched", []),
+                    "yahoo_data": yahoo.get("data", {}),
+                    "excerpt": json.dumps(yahoo.get("data", {}))[:2000],
+                }
 
     if not req.force_refresh:
         cached = await cache.get(target_url)
@@ -339,5 +444,5 @@ async def clear_cache(_: None = Depends(_auth)):
 async def legacy_cards_removed():
     raise HTTPException(
         410,
-        detail="Cards/extract endpoints removed. Use /quote, /news, /sec, or /v1/scrape.",
+        detail="Cards/extract endpoints removed. Use /quote/full, /finance/scrape, /quote, /news, or /sec.",
     )
