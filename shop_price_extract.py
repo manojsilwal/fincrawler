@@ -387,6 +387,97 @@ def retailer_prompt_hint(retailer_key: str) -> str:
     return _RETAILER_PROMPT_HINTS.get(retailer_key, "")
 
 
+def _coerce_listing_price(val: Any) -> float | None:
+    if val is None:
+        return None
+    try:
+        price = float(str(val).replace(",", "").replace("$", "").strip())
+    except (TypeError, ValueError):
+        return None
+    if not _is_plausible_product_price(price):
+        return None
+    return round(price, 2)
+
+
+def normalize_listing_item(item: dict[str, Any], query: str) -> dict[str, Any] | None:
+    """Normalize one shop listing dict from LLM/vision/HTML."""
+    if not isinstance(item, dict):
+        return None
+    name = (item.get("product_name") or item.get("title") or item.get("name") or "").strip()
+    if name.startswith((":root", "@charset", "{", "--")) or "border-width" in name:
+        return None
+    price = _coerce_listing_price(item.get("price"))
+    if not name or price is None:
+        return None
+    floor = _query_price_floor(query)
+    if price < floor:
+        return None
+    original = _coerce_listing_price(item.get("original_price") or item.get("list_price"))
+    out: dict[str, Any] = {
+        "product_name": name,
+        "price": price,
+        "product_url": item.get("product_url") or item.get("url"),
+        "seller": item.get("seller"),
+        "availability": item.get("availability"),
+        "rating": item.get("rating"),
+        "review_count": item.get("review_count"),
+    }
+    if original is not None and original > price:
+        out["original_price"] = original
+    return {k: v for k, v in out.items() if v is not None}
+
+
+def dedupe_sort_products(products: list[dict[str, Any]], query: str, max_items: int = 10) -> list[dict[str, Any]]:
+    seen: set[tuple[str, float, str]] = set()
+    sorted_items = sorted(products, key=lambda p: float(p.get("price") or 999_999.0))
+    out: list[dict[str, Any]] = []
+    for item in sorted_items:
+        seller = str(item.get("seller") or "").lower()
+        key = (str(item.get("product_name") or "").lower()[:80], float(item["price"]), seller)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+        if len(out) >= max_items:
+            break
+    return out
+
+
+def normalize_shop_data(data: dict[str, Any], query: str, *, max_products: int = 10) -> dict[str, Any]:
+    """
+    Normalize single or multi-product shop payloads.
+    Sets product_name/price from the lowest valid listing for backward compatibility.
+    """
+    data = dict(data or {})
+    products: list[dict[str, Any]] = []
+    raw_products = data.get("products")
+    if isinstance(raw_products, list) and raw_products:
+        for item in raw_products:
+            norm = normalize_listing_item(item, query)
+            if norm:
+                products.append(norm)
+    elif data.get("price") or data.get("product_name") or data.get("title"):
+        norm = normalize_listing_item(data, query)
+        if norm:
+            products = [norm]
+
+    products = dedupe_sort_products(products, query, max_products)
+    if products:
+        best = products[0]
+        data["products"] = products
+        data["product_name"] = best["product_name"]
+        data["price"] = best["price"]
+        if best.get("original_price") is not None:
+            data["original_price"] = best["original_price"]
+        if best.get("seller"):
+            data["seller"] = best["seller"]
+        if best.get("product_url"):
+            data["product_url"] = best["product_url"]
+        if data.get("_error") == "product_not_found":
+            del data["_error"]
+    return data
+
+
 def merge_shop_extraction(
     llm_data: dict[str, Any],
     candidates: list[float],
@@ -398,6 +489,11 @@ def merge_shop_extraction(
     Backfill missing LLM price from regex candidates; annotate price_source.
     """
     data = dict(llm_data) if llm_data else {}
+    if isinstance(data.get("products"), list) and data["products"]:
+        normalized = normalize_shop_data(data, query)
+        if normalized.get("products"):
+            normalized.setdefault("price_source", "llm")
+            return normalized
     name = (data.get("product_name") or data.get("title") or "").strip()
     if name.startswith((":root", "@charset", "{", "--")) or "border-width" in name:
         data.pop("product_name", None)
@@ -433,7 +529,7 @@ def merge_shop_extraction(
 
     if candidates:
         data["price_candidates_usd"] = candidates
-    return data
+    return normalize_shop_data(data, query)
 
 
 def crawl_likely_blocked(crawl: dict) -> bool:

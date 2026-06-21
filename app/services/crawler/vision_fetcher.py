@@ -69,40 +69,64 @@ def shopping_vision_has_signal(data: dict[str, Any]) -> bool:
     return isinstance(products, list) and len(products) > 0
 
 
-def vision_flat_to_shopping_data(flat: dict[str, Any], extracted: dict[str, Any]) -> dict[str, Any]:
-    """Map vision extraction to shop_service field names."""
-    if extracted.get("products") and isinstance(extracted["products"], list) and extracted["products"]:
-        row = dict(extracted["products"][0])
+def vision_flat_to_shopping_data(
+    flat: dict[str, Any],
+    extracted: dict[str, Any],
+    *,
+    query: str = "",
+) -> dict[str, Any]:
+    """Map vision extraction to shop_service field names (single or multi-product)."""
+    from shop_price_extract import normalize_shop_data
+
+    base: dict[str, Any] = {"price_source": "vision"}
+    raw_products = extracted.get("products")
+    if isinstance(raw_products, list) and raw_products:
+        base["products"] = [dict(p) for p in raw_products if isinstance(p, dict)]
     else:
-        row = {
-            "product_name": flat.get("vision.product_name") or flat.get("vision.products.0.product_name"),
-            "price": flat.get("vision.price") or flat.get("vision.products.0.price"),
-            "original_price": flat.get("vision.original_price"),
-            "availability": flat.get("vision.availability"),
-            "seller": flat.get("vision.seller"),
-            "rating": flat.get("vision.rating"),
-            "review_count": flat.get("vision.review_count"),
-            "product_url": flat.get("vision.product_url"),
-        }
+        base.update(
+            {
+                "product_name": flat.get("vision.product_name") or flat.get("vision.products.0.product_name"),
+                "price": flat.get("vision.price") or flat.get("vision.products.0.price"),
+                "original_price": flat.get("vision.original_price") or flat.get("vision.products.0.original_price"),
+                "availability": flat.get("vision.availability"),
+                "seller": flat.get("vision.seller") or flat.get("vision.products.0.seller"),
+                "rating": flat.get("vision.rating"),
+                "review_count": flat.get("vision.review_count"),
+                "product_url": flat.get("vision.product_url") or flat.get("vision.products.0.product_url"),
+            }
+        )
         for k, v in extracted.items():
             if not str(k).startswith("_") and k not in ("products", "news") and v is not None:
-                if k not in row or row[k] is None:
-                    row[k] = v
+                if k not in base or base[k] is None:
+                    base[k] = v
 
-    if row.get("price") is not None:
+    if query:
+        return normalize_shop_data(base, query)
+    if base.get("price") is not None:
         try:
-            row["price"] = float(str(row["price"]).replace(",", "").replace("$", ""))
+            base["price"] = float(str(base["price"]).replace(",", "").replace("$", ""))
         except (TypeError, ValueError):
-            row["price"] = None
-    row["price_source"] = "vision"
-    return {k: v for k, v in row.items() if v is not None}
+            base["price"] = None
+    return {k: v for k, v in base.items() if v is not None}
 
 
 async def capture_screenshots_for_url(
     url: str,
     *,
     retailer_key: str = "",
+    pre_capture=None,
 ) -> tuple[list[bytes], dict[str, Any]]:
+    if retailer_key:
+        from app.services.crawler.browser_fetcher import capture_stealth_screenshots
+
+        images, meta = await capture_stealth_screenshots(
+            url,
+            retailer_key=retailer_key,
+            pre_capture=pre_capture,
+        )
+        meta.setdefault("url", url)
+        return images, meta
+
     from app.config import get_settings
     from app.services.asp.profiles import get_retailer_profile
     from app.services.crawler.browser_pool import get_browser_pool
@@ -111,7 +135,7 @@ async def capture_screenshots_for_url(
 
     profile = get_retailer_profile(retailer_key)
     settings = get_settings()
-    meta: dict[str, Any] = {"path": "screenshot_vision_scroll", "url": url}
+    meta: dict[str, Any] = {"path": "screenshot_vision_scroll", "url": url, "requested_url": url}
 
     pool = await get_browser_pool(size=settings.browser_pool_size)
     async with pool.page(retailer_key=retailer_key or None) as (page, _ctx):
@@ -126,11 +150,15 @@ async def capture_screenshots_for_url(
                 pass
         await page.wait_for_timeout(int(profile.get("hydration_wait_ms") or 6000))
         await run_behavior(page)
+        if pre_capture is not None:
+            await pre_capture(page)
 
         shots = await capture_scrolled_screenshots(page)
         meta["screenshot_count"] = len(shots)
         meta["screenshot_bytes"] = sum(s["bytes"] for s in shots)
         meta["screenshot_scroll_ys"] = [s["scroll_y"] for s in shots]
+        meta["final_url"] = page.url
+        meta["page_title"] = await page.title()
         images = [s["png"] for s in shots]
 
     return images, meta
@@ -146,11 +174,16 @@ async def vision_extract_page(
     field_prefix: str = "vision",
     exclude_keys: tuple[str, ...] = ("news",),
     field_aliases: list[tuple[str, str]] | None = None,
+    pre_capture=None,
 ) -> dict[str, Any]:
     """
     Scroll-capture screenshots of *url* and extract structured data via vision LLM.
     """
-    images, meta = await capture_screenshots_for_url(url, retailer_key=retailer_key)
+    images, meta = await capture_screenshots_for_url(
+        url,
+        retailer_key=retailer_key,
+        pre_capture=pre_capture,
+    )
     if not images:
         return {
             "ok": False,
@@ -200,7 +233,11 @@ async def vision_extract_shopping(
         task="shopping",
         extra_context=f"Retailer: {retailer_key}. Query: {query}.",
     )
-    data = vision_flat_to_shopping_data(result.get("flat") or {}, result.get("extracted") or {})
+    data = vision_flat_to_shopping_data(
+        result.get("flat") or {},
+        result.get("extracted") or {},
+        query=query,
+    )
     if candidates:
         data = merge_shop_extraction(data, candidates, query=query, retailer_key=retailer_key)
     result["data"] = data

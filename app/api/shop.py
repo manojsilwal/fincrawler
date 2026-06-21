@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import json
 import os
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.schemas import ShopSearchRequest
-from app.services.shop_service import search_product
+from app.services.shop_service import search_product, search_product_stream
 
 router = APIRouter(prefix="/shop", tags=["Shopping"])
 
@@ -30,6 +32,7 @@ async def shop_search(req: ShopSearchRequest, db: Session = Depends(get_db), _: 
         query=req.query.strip(),
         retailers=req.retailers,
         max_concurrency=req.max_concurrency,
+        per_retailer_timeout_sec=req.per_retailer_timeout_sec,
     )
     ok = sum(1 for r in results if r.get("status") == "ok")
     blocked = sum(1 for r in results if r.get("status") == "blocked")
@@ -40,6 +43,33 @@ async def shop_search(req: ShopSearchRequest, db: Session = Depends(get_db), _: 
         "retailers_blocked": blocked,
         "results": results,
     }
+
+
+@router.post("/search/stream")
+async def shop_search_stream(
+    req: ShopSearchRequest,
+    db: Session = Depends(get_db),
+    _: None = Depends(_require_api_key),
+):
+    """Stream each retailer result as NDJSON, then a summary envelope."""
+    if not req.query.strip():
+        raise HTTPException(400, "query is required")
+
+    async def ndjson():
+        async for event in search_product_stream(
+            db,
+            query=req.query.strip(),
+            retailers=req.retailers,
+            max_concurrency=req.max_concurrency,
+            per_retailer_timeout_sec=req.per_retailer_timeout_sec,
+        ):
+            yield json.dumps(event, ensure_ascii=False, default=str) + "\n"
+
+    return StreamingResponse(
+        ndjson(),
+        media_type="application/x-ndjson; charset=utf-8",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @router.get("/retailers")

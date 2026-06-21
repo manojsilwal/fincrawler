@@ -28,10 +28,23 @@ class TestVisionFetcher(unittest.TestCase):
     def test_vision_flat_to_shopping_data(self):
         flat = {"vision.product_name": "Laptop", "vision.price": 899.0}
         extracted = {"product_name": "Laptop", "price": 899.0}
-        data = vision_flat_to_shopping_data(flat, extracted)
+        data = vision_flat_to_shopping_data(flat, extracted, query="laptop")
         self.assertEqual(data["product_name"], "Laptop")
         self.assertEqual(data["price"], 899.0)
         self.assertEqual(data["price_source"], "vision")
+
+    def test_vision_flat_multi_product(self):
+        extracted = {
+            "products": [
+                {"product_name": "DJI Osmo Pocket 3", "price": 419.0, "seller": "Amazon"},
+                {"product_name": "DJI Osmo Pocket 3 Creator Combo", "price": 519.0, "seller": "Amazon Warehouse"},
+            ]
+        }
+        data = vision_flat_to_shopping_data({}, extracted, query="dji osmo pocket 3")
+        self.assertIn("products", data)
+        self.assertGreaterEqual(len(data["products"]), 2)
+        self.assertEqual(data["product_name"], "DJI Osmo Pocket 3")
+        self.assertEqual(data["price"], 419.0)
 
     def test_vision_fallback_enabled_default(self):
         self.assertTrue(vision_fallback_enabled())

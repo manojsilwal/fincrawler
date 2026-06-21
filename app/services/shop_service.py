@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import urllib.parse
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -18,15 +19,17 @@ from app.services.normalization.product_normalizer import ProductNormalizer
 from app.services.ranking.product_ranker import ProductRanker
 from app.services.source_registry import SourceRegistry
 from llm import extract_structured
-from shop_price_extract import merge_shop_extraction, prepare_llm_context, retailer_prompt_hint
+from shop_price_extract import merge_shop_extraction, normalize_shop_data, prepare_llm_context, retailer_prompt_hint
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_RETAILERS = ("amazon", "walmart", "ebay", "bestbuy", "target")
 
 _SHOP_PROMPT = """Extract shopping/product information for "{query}" from this retail search page.
-Return JSON: product_name, price (float USD), original_price, availability, seller, rating, review_count, product_url.
-Ignore accessories. If not found: {{"_error": "product_not_found"}}."""
+For a search results page, return JSON with a products array (max 10 listings). Each item:
+product_name, price (float USD), original_price, seller, rating, review_count, product_url, availability.
+For a single product page, you may return either one products[] entry or top-level product_name and price.
+Ignore accessories and sponsored noise. If not found: {{"_error": "product_not_found"}}."""
 
 _registry = SourceRegistry()
 _normalizer = ProductNormalizer()
@@ -40,6 +43,7 @@ async def _extract_with_llm(crawl: dict, query: str, retailer_key: str) -> dict:
     excerpt = crawl.get("price_html_excerpt") or ""
     if not html and excerpt:
         html = excerpt
+    fields = extract_product_fields(html, page_text)
     llm_context, candidates = prepare_llm_context(page_text, html, query, retailer_key)
     pre_candidates = crawl.get("price_candidates_usd") or []
     if pre_candidates:
@@ -53,8 +57,9 @@ async def _extract_with_llm(crawl: dict, query: str, retailer_key: str) -> dict:
         task="shopping",
     )
     merged = merge_shop_extraction(extracted, candidates, query=query, retailer_key=retailer_key)
-    if merged.get("price") or merged.get("product_name"):
-        return merged
+    normalized = normalize_shop_data(merged, query)
+    if normalized.get("products") or normalized.get("price"):
+        return normalized
     if fields.get("_error") or not (fields.get("price") or fields.get("title")):
         if vision_fallback_enabled() and crawl.get("url"):
             vision = await vision_extract_shopping(
@@ -68,16 +73,19 @@ async def _extract_with_llm(crawl: dict, query: str, retailer_key: str) -> dict:
                 out["price_source"] = "vision"
                 return out
         if fields.get("_error"):
-            return merged
-    return {
-        "product_name": fields.get("title"),
-        "price": fields.get("price"),
-        "availability": fields.get("availability"),
-        "rating": fields.get("rating"),
-        "review_count": fields.get("review_count"),
-        "product_url": crawl.get("url"),
-        "price_source": "html_extract",
-    }
+            return normalized
+    return normalize_shop_data(
+        {
+            "product_name": fields.get("title"),
+            "price": fields.get("price"),
+            "availability": fields.get("availability"),
+            "rating": fields.get("rating"),
+            "review_count": fields.get("review_count"),
+            "product_url": crawl.get("url"),
+            "price_source": "html_extract",
+        },
+        query,
+    )
 
 
 def _persist_offer(db: Session, source, product_id, data: dict, crawl: dict):
@@ -146,7 +154,7 @@ async def _run_one(db: Session, retailer_key: str, query: str) -> dict:
         if vision_fallback_enabled():
             vision = await vision_extract_shopping(url, query=query, retailer_key=retailer_key)
             if shopping_vision_has_signal(vision.get("data") or {}):
-                data = vision["data"]
+                data = normalize_shop_data(dict(vision["data"]), query)
                 norm = _normalizer.normalize({**data, "title": data.get("product_name")})
                 match = _matcher.find_or_create_product(db, norm)
                 _persist_offer(db, source, match["product_id"], data, crawl)
@@ -167,7 +175,7 @@ async def _run_one(db: Session, retailer_key: str, query: str) -> dict:
     if vision_fallback_enabled() and not is_usable_scrape(crawl, retailer_key):
         vision = await vision_extract_shopping(url, query=query, retailer_key=retailer_key)
         if shopping_vision_has_signal(vision.get("data") or {}):
-            data = vision["data"]
+            data = normalize_shop_data(dict(vision["data"]), query)
             norm = _normalizer.normalize({**data, "title": data.get("product_name")})
             match = _matcher.find_or_create_product(db, norm)
             _persist_offer(db, source, match["product_id"], data, crawl)
@@ -179,6 +187,7 @@ async def _run_one(db: Session, retailer_key: str, query: str) -> dict:
             return result
 
     data = await _extract_with_llm(crawl, query, retailer_key)
+    data = normalize_shop_data(data, query)
     norm = _normalizer.normalize({**data, "title": data.get("product_name")})
     match = _matcher.find_or_create_product(db, norm)
     _persist_offer(db, source, match["product_id"], data, crawl)
@@ -195,15 +204,80 @@ async def search_product(
     query: str,
     retailers: list[str] | None = None,
     max_concurrency: int = 2,
+    per_retailer_timeout_sec: float | None = None,
 ) -> list[dict]:
     keys = [r for r in (retailers or list(DEFAULT_RETAILERS)) if r in DEFAULT_RETAILERS]
     sem = asyncio.Semaphore(max_concurrency)
+    timeout = per_retailer_timeout_sec
+    if timeout is None:
+        raw = os.getenv("SHOP_STREAM_PER_RETAILER_TIMEOUT_SEC", "90").strip()
+        timeout = float(raw) if raw else None
 
     async def wrapped(key: str):
         async with sem:
-            return await _run_one(db, key, query)
+            if timeout is None:
+                return await _run_one(db, key, query)
+            try:
+                return await asyncio.wait_for(_run_one(db, key, query), timeout=timeout)
+            except asyncio.TimeoutError:
+                return {
+                    "retailer_key": key,
+                    "retailer": key.title(),
+                    "status": "error",
+                    "error": "retailer_timeout",
+                }
 
     return list(await asyncio.gather(*[wrapped(k) for k in keys]))
+
+
+async def search_product_stream(
+    db: Session,
+    query: str,
+    retailers: list[str] | None = None,
+    max_concurrency: int = 2,
+    per_retailer_timeout_sec: float | None = None,
+):
+    """Yield NDJSON-style events as each retailer agent finishes."""
+    keys = [r for r in (retailers or list(DEFAULT_RETAILERS)) if r in DEFAULT_RETAILERS]
+    sem = asyncio.Semaphore(max_concurrency)
+    results: list[dict] = []
+    timeout = per_retailer_timeout_sec
+    if timeout is None:
+        raw = os.getenv("SHOP_STREAM_PER_RETAILER_TIMEOUT_SEC", "90").strip()
+        timeout = float(raw) if raw else None
+
+    async def wrapped(key: str):
+        async with sem:
+            if timeout is None:
+                return await _run_one(db, key, query)
+            try:
+                return await asyncio.wait_for(_run_one(db, key, query), timeout=timeout)
+            except asyncio.TimeoutError:
+                return {
+                    "retailer_key": key,
+                    "retailer": key.title(),
+                    "status": "error",
+                    "error": "retailer_timeout",
+                }
+
+    task_map = {asyncio.create_task(wrapped(k)): k for k in keys}
+    for finished in asyncio.as_completed(task_map.keys()):
+        result = await finished
+        results.append(result)
+        yield {"type": "retailer", "data": result}
+
+    ok = sum(1 for r in results if r.get("status") == "ok")
+    blocked = sum(1 for r in results if r.get("status") == "blocked")
+    yield {
+        "type": "summary",
+        "data": {
+            "query": query,
+            "retailers_attempted": len(results),
+            "retailers_success": ok,
+            "retailers_blocked": blocked,
+            "results": results,
+        },
+    }
 
 
 def search_ranked_offers(db: Session, query: str, price_max: float | None = None) -> list[dict]:

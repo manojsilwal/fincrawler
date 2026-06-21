@@ -68,6 +68,7 @@ class ShopSearchRequest(BaseModel):
     query: str
     retailers: Optional[list[str]] = None
     max_concurrency: int = Field(default=5, ge=1, le=5)
+    per_retailer_timeout_sec: Optional[float] = Field(default=None, ge=10, le=600)
 
 
 class ProductOut(BaseModel):
