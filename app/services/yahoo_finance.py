@@ -44,6 +44,8 @@ _BROWSER_UA = (
 
 YAHOO_RETAILER_KEY = "yahoo_finance"
 
+_yahoo_fetch_semaphore = asyncio.Semaphore(int(os.getenv("YAHOO_FETCH_CONCURRENCY", "2")))
+
 _PRICE_FIELD_KEYS = (
     "price.regularMarketPrice",
     "dom.regularMarketPrice",
@@ -228,6 +230,18 @@ async def fetch_quote_summary_http(
 ) -> dict[str, Any]:
     """Fetch quoteSummary via Yahoo JSON API (requires session cookie + crumb)."""
     sym = ticker.upper().strip()
+    use_curl = os.getenv("YAHOO_USE_CURL_CFFI", "true").lower() not in ("0", "false", "no")
+    if use_curl:
+        from app.services.crawler.yahoo_curl_client import fetch_yahoo_quote_summary_curl
+
+        curl_result = await fetch_yahoo_quote_summary_curl(sym, modules=modules)
+        if curl_result.get("modules"):
+            return {
+                "modules": curl_result["modules"],
+                "source": curl_result.get("source", "yahoo_curl_api"),
+                "host": curl_result.get("host"),
+            }
+
     mod_str = ",".join(modules)
     async with await _yahoo_client() as client:
         await client.get(f"https://finance.yahoo.com/quote/{sym}/")
@@ -249,6 +263,42 @@ async def fetch_quote_summary_http(
                     return {"modules": result[0], "source": "yahoo_api", "host": host}
             logger.info("quoteSummary %s returned %s for %s", host, r.status_code, sym)
     return {}
+
+
+async def fetch_yahoo_chart_http(ticker: str) -> dict[str, Any]:
+    """Lightweight chart API fallback for price and session when quoteSummary is rate-limited."""
+    sym = ticker.upper().strip()
+    use_curl = os.getenv("YAHOO_USE_CURL_CFFI", "true").lower() not in ("0", "false", "no")
+    if use_curl:
+        from app.services.crawler.yahoo_curl_client import fetch_yahoo_chart_curl
+
+        curl_result = await fetch_yahoo_chart_curl(sym)
+        if curl_result.get("flat"):
+            return curl_result
+
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}"
+    params = {"interval": "1d", "range": "1d"}
+    flat: dict[str, Any] = {}
+    try:
+        async with await _yahoo_client() as client:
+            r = await client.get(url, params=params)
+            if r.status_code != 200:
+                return {"flat": flat, "source": "yahoo_chart_failed", "status": r.status_code}
+            rows = (r.json().get("chart") or {}).get("result") or []
+            if not rows:
+                return {"flat": flat, "source": "yahoo_chart_empty"}
+            meta = rows[0].get("meta") or {}
+            price = meta.get("regularMarketPrice")
+            if price is not None:
+                flat["chart.regularMarketPrice"] = price
+            if meta.get("currency"):
+                flat["chart.currency"] = meta["currency"]
+            if meta.get("shortName"):
+                flat["chart.shortName"] = meta["shortName"]
+    except Exception:
+        logger.debug("Yahoo chart API failed for %s", sym, exc_info=True)
+        return {"flat": flat, "source": "yahoo_chart_error"}
+    return {"flat": flat, "source": "yahoo_chart"}
 
 
 def parse_fin_streamers_from_html(html: str, symbol: str) -> dict[str, Any]:
@@ -283,7 +333,121 @@ def _coerce_price_value(val: Any) -> float | None:
         return None
 
 
-def _has_quote_price(flat: dict[str, Any]) -> bool:
+def _normalize_ticker_symbol(symbol: str) -> str:
+    return (symbol or "").upper().strip().replace(".", "-")
+
+
+def _tickers_match(requested: str, found: str | None) -> bool:
+    if not found:
+        return False
+    return _normalize_ticker_symbol(requested) == _normalize_ticker_symbol(found)
+
+
+def _flat_field_ticker(flat: dict[str, Any], prefix: str) -> str | None:
+    for key in (f"{prefix}.ticker", f"{prefix}.symbol"):
+        val = flat.get(key)
+        if val is not None and str(val).strip():
+            return str(val).strip()
+    return None
+
+
+def parse_flat_price_for_ticker(flat: dict[str, Any], symbol: str) -> float | None:
+    """
+    Return regularMarketPrice only when the source is scoped to *symbol*.
+
+    Unscoped ASP/DOM prices (e.g. Bitcoin widgets on an MSFT page) are ignored.
+    """
+    if not flat or not symbol:
+        return None
+    sym = _normalize_ticker_symbol(symbol)
+
+    api_price = _coerce_price_value(flat.get("price.regularMarketPrice"))
+    if api_price and api_price > 0:
+        api_sym = flat.get("price.symbol")
+        if api_sym is None or _tickers_match(sym, str(api_sym)):
+            return api_price
+
+    for price_key, ticker_keys in (
+        ("vision.regularMarketPrice", ("vision.ticker", "vision.quote_header.ticker")),
+        ("vision.quote_header.regularMarketPrice", ("vision.quote_header.ticker", "vision.ticker")),
+    ):
+        price = _coerce_price_value(flat.get(price_key))
+        if not price or price <= 0:
+            continue
+        vtick = next((str(flat[k]) for k in ticker_keys if flat.get(k)), None)
+        if vtick and not _tickers_match(sym, vtick):
+            continue
+        return price
+
+    html_price = _coerce_price_value(flat.get("html.regularMarketPrice"))
+    if html_price and html_price > 0:
+        return html_price
+
+    dom_price = _coerce_price_value(flat.get("dom.regularMarketPrice"))
+    if dom_price and dom_price > 0:
+        dom_sym = _flat_field_ticker(flat, "dom") or flat.get("dom.symbol")
+        if dom_sym and _tickers_match(sym, str(dom_sym)):
+            return dom_price
+
+    asp_price = _coerce_price_value(flat.get("asp.regularMarketPrice"))
+    if asp_price and asp_price > 0:
+        asp_sym = _flat_field_ticker(flat, "asp")
+        if asp_sym and _tickers_match(sym, asp_sym):
+            return asp_price
+        return None
+
+    chart_price = _coerce_price_value(flat.get("chart.regularMarketPrice"))
+    if chart_price and chart_price > 0:
+        chart_sym = _flat_field_ticker(flat, "chart") or flat.get("chart.symbol")
+        if chart_sym and _tickers_match(sym, str(chart_sym)):
+            return chart_price
+
+    return None
+
+
+def _sanitize_flat_for_ticker(flat: dict[str, Any], symbol: str) -> dict[str, Any]:
+    """Drop fields from sources whose ticker does not match *symbol*."""
+    out = dict(flat)
+    sym = _normalize_ticker_symbol(symbol)
+    for prefix in ("asp", "dom", "chart"):
+        ptick = _flat_field_ticker(out, prefix)
+        if ptick and not _tickers_match(sym, ptick):
+            for key in list(out.keys()):
+                if key.startswith(f"{prefix}."):
+                    out.pop(key, None)
+    if "asp.regularMarketPrice" in out and not _flat_field_ticker(out, "asp"):
+        for key in list(out.keys()):
+            if key.startswith("asp.") and (
+                "regularMarket" in key or key in ("asp.marketCap", "asp.shortName")
+            ):
+                out.pop(key, None)
+    return out
+
+
+def is_valid_yahoo_quote(
+    symbol: str,
+    flat: dict[str, Any],
+    *,
+    modules_fetched: list[str] | None = None,
+) -> bool:
+    """True when *flat* contains a ticker-scoped regularMarketPrice for *symbol*."""
+    if not flat:
+        return False
+    price = parse_flat_price_for_ticker(flat, symbol)
+    if not price or price <= 0:
+        return False
+    for prefix in ("asp",):
+        ptick = _flat_field_ticker(flat, prefix)
+        if ptick and not _tickers_match(symbol, ptick):
+            bleed = _coerce_price_value(flat.get(f"{prefix}.regularMarketPrice"))
+            if bleed and bleed > 0 and bleed == price:
+                return False
+    return True
+
+
+def _has_quote_price(flat: dict[str, Any], symbol: str | None = None) -> bool:
+    if symbol:
+        return parse_flat_price_for_ticker(flat, symbol) is not None
     for key in _PRICE_FIELD_KEYS:
         if _coerce_price_value(flat.get(key)):
             return True
@@ -308,6 +472,100 @@ def _strip_news_from_flat(flat: dict[str, Any]) -> dict[str, Any]:
 def _yahoo_api_succeeded(modules: dict[str, Any]) -> bool:
     """True when quoteSummary returned module payload."""
     return bool(modules)
+
+
+def _first_flat(flat: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        val = flat.get(key)
+        if val is not None:
+            return val
+    return None
+
+
+def build_scorecard_from_flat(flat: dict[str, Any]) -> dict[str, Any]:
+    """Map Yahoo flat fields to TradeTalk business quality scorecard tiles."""
+    fcf = _first_flat(
+        flat,
+        "financialData.freeCashflow",
+        "vision.financial_highlights.freeCashflow",
+        "vision.statistics.freeCashflow",
+    )
+    debt = _first_flat(
+        flat,
+        "financialData.totalDebt",
+        "vision.financial_highlights.totalDebt",
+    )
+    margin = _first_flat(
+        flat,
+        "financialData.profitMargins",
+        "vision.financial_highlights.profitMargins",
+        "vision.financial_highlights.operatingMargins",
+    )
+    current_ratio = _first_flat(
+        flat,
+        "financialData.currentRatio",
+        "vision.statistics.currentRatio",
+        "vision.financial_highlights.currentRatio",
+    )
+
+    roic = _first_flat(
+        flat,
+        "defaultKeyStatistics.returnOnCapital",
+        "vision.statistics.returnOnCapital",
+    )
+    if roic is None:
+        ocf = _first_flat(
+            flat,
+            "financialData.operatingCashflow",
+            "vision.financial_highlights.operatingCashflow",
+            "vision.statistics.operatingCashflow",
+        )
+        total_debt = debt
+        total_cash = _first_flat(
+            flat,
+            "financialData.totalCash",
+            "vision.financial_highlights.totalCash",
+        )
+        if ocf is not None and total_debt is not None:
+            try:
+                invested = float(total_debt) - float(total_cash or 0)
+                if invested > 0:
+                    roic = float(ocf) / invested
+            except (TypeError, ValueError):
+                pass
+
+    populated = sum(
+        1 for v in (roic, fcf, debt, margin, current_ratio) if v is not None
+    )
+    return {
+        "roic": roic,
+        "moat": None,
+        "moat_source": "agent_required",
+        "fcf": fcf,
+        "debt": debt,
+        "margin": margin,
+        "current_ratio": current_ratio,
+        "populated_count": populated,
+    }
+
+
+def build_yahoo_scrape_response(target_url: str, sym: str, yahoo: dict[str, Any]) -> dict[str, Any]:
+    """Structured envelope for POST /scrape and /crawl on Yahoo quote URLs."""
+    data = yahoo.get("data") or {}
+    scorecard = yahoo.get("scorecard") or build_scorecard_from_flat(data)
+    return {
+        "url": target_url,
+        "status": "ok",
+        "status_code": 200,
+        "title": data.get("price.shortName") or sym,
+        "ticker": sym,
+        "source": yahoo.get("source"),
+        "field_count": yahoo.get("field_count", 0),
+        "modules_fetched": yahoo.get("modules_fetched", []),
+        "yahoo_data": data,
+        "scorecard": scorecard,
+        "excerpt": json.dumps(data)[:2000],
+    }
 
 
 def _vision_fallback_enabled() -> bool:
@@ -458,10 +716,31 @@ _YAHOO_VISION_PROMPT = (
     "numberOfAnalystOpinions\n"
     "4) profile: sector, industry, fullTimeEmployees, website, longBusinessSummary (truncate if long)\n"
     "5) financial_highlights: totalRevenue, revenuePerShare, grossProfits, ebitda, profitMargins, "
-    "operatingMargins, returnOnEquity, returnOnAssets, totalCash, totalDebt, debtToEquity\n"
-    "6) holders_or_insiders: any visible holder/insider rows as array of {name, shares, value}\n"
+    "operatingMargins, returnOnEquity, returnOnAssets, totalCash, totalDebt, debtToEquity, "
+    "freeCashflow, operatingCashflow\n"
+    "6) statistics: currentRatio, quickRatio, freeCashflow, operatingCashflow, returnOnCapital "
+    "(from Statistics / Key Statistics / Financials tabs if visible in any panel)\n"
+    "7) holders_or_insiders: any visible holder/insider rows as array of {name, shares, value}\n"
     "Use null for fields not visible in any panel. Do not invent values. Do not extract news headlines."
 )
+
+
+async def _yahoo_click_stats_tabs(page) -> None:
+    """Try in-page Statistics / Financials tabs (avoid full navigation away from quote)."""
+    selectors = (
+        '[data-test="STATISTICS-tab"]',
+        '[data-test="FINANCIALS-tab"]',
+        'button:has-text("Statistics")',
+        'button:has-text("Financials")',
+    )
+    for sel in selectors:
+        try:
+            loc = page.locator(sel).first
+            if await loc.count() > 0:
+                await loc.click(timeout=3000)
+                await page.wait_for_timeout(900)
+        except Exception:
+            continue
 
 
 async def fetch_yahoo_via_screenshot(ticker: str) -> dict[str, Any]:
@@ -479,13 +758,16 @@ async def fetch_yahoo_via_screenshot(ticker: str) -> dict[str, Any]:
         retailer_key=YAHOO_RETAILER_KEY,
         prompt=_YAHOO_VISION_PROMPT,
         task="finance",
-        extra_context=f"Ticker: {sym}.",
+        extra_context=f"Ticker: {sym}. Scroll panels may include Statistics and Financials tabs.",
         field_aliases=[
             ("quote_header.regularMarketPrice", "vision.regularMarketPrice"),
             ("regularMarketPrice", "vision.regularMarketPrice"),
             ("quote_header.ticker", "vision.ticker"),
             ("ticker", "vision.ticker"),
+            ("financial_highlights.freeCashflow", "vision.financial_highlights.freeCashflow"),
+            ("statistics.currentRatio", "vision.statistics.currentRatio"),
         ],
+        pre_capture=_yahoo_click_stats_tabs,
     )
     flat = _strip_news_from_flat(vision.get("flat") or {})
     extracted = vision.get("extracted") or {}
@@ -575,8 +857,8 @@ async def fetch_yahoo_modules_via_browser_network(ticker: str) -> dict[str, Any]
 
 async def fetch_yahoo_via_asp(ticker: str) -> dict[str, Any]:
     """
-    Fetch through FinCrawler ASP: browser_grid → impersonate → stealth browser
-    → captcha browser → proxy rotation, with stealth-browser fallback.
+    Fetch through FinCrawler ASP: stealth browser first (fast on GCP), optional browser_grid,
+    then session API, HTTP quoteSummary, network capture, chart API, and vision fallback.
     """
     from app.services.crawler.browser_fetcher import fetch_stealth_browser
     from app.services.crawler.managed_fetcher import fetch_managed
@@ -584,38 +866,55 @@ async def fetch_yahoo_via_asp(ticker: str) -> dict[str, Any]:
     sym = ticker.upper().strip()
     page_url = f"https://finance.yahoo.com/quote/{sym}/"
     meta: dict[str, Any] = {"retailer_key": YAHOO_RETAILER_KEY}
-
-    asp_result = await fetch_managed(page_url, retailer_key=YAHOO_RETAILER_KEY)
-    meta.update(
-        {
-            "asp_status": asp_result.get("status"),
-            "asp_attempts": asp_result.get("asp_attempts") or [],
-            "fetch_backend": asp_result.get("fetch_backend"),
-            "tier_used": asp_result.get("tier_used"),
-            "tier_name": asp_result.get("tier_name"),
-            "block_reason": asp_result.get("block_reason"),
-        }
-    )
+    use_browser_grid = os.getenv("YAHOO_USE_BROWSER_GRID", "false").lower() in ("1", "true", "yes")
+    use_curl = os.getenv("YAHOO_USE_CURL_CFFI", "true").lower() not in ("0", "false", "no")
 
     flat: dict[str, Any] = {}
     html = ""
     modules: dict[str, Any] = {}
+    asp_result: dict[str, Any] = {"status": "skipped"}
+    stealth: dict[str, Any] = {"status": "skipped"}
 
-    if asp_result.get("status") == "ok":
-        flat = extract_quote_from_fetch_result(asp_result, sym)
-        html = asp_result.get("html") or ""
+    # Fast path: curl_cffi TLS impersonation (~3s on GCP vs ~45s browser)
+    if use_curl:
+        from app.services.crawler.yahoo_curl_client import fetch_yahoo_quote_summary_curl
 
-    if asp_result.get("status") != "ok" or not _has_quote_price(flat):
-        meta["stealth_fallback"] = True
+        meta["yahoo_curl_first"] = True
+        curl_result = await fetch_yahoo_quote_summary_curl(sym)
+        meta["yahoo_curl_meta"] = curl_result.get("meta")
+        if curl_result.get("modules"):
+            modules = curl_result["modules"]
+            meta["yahoo_api_host"] = curl_result.get("host")
+            meta["yahoo_api_source"] = curl_result.get("source", "yahoo_curl_api")
+
+    need_browser = not _yahoo_api_succeeded(modules)
+
+    if need_browser and use_browser_grid:
+        asp_result = await fetch_managed(page_url, retailer_key=YAHOO_RETAILER_KEY)
+        meta.update(
+            {
+                "asp_status": asp_result.get("status"),
+                "asp_attempts": asp_result.get("asp_attempts") or [],
+                "fetch_backend": asp_result.get("fetch_backend"),
+                "tier_used": asp_result.get("tier_used"),
+                "tier_name": asp_result.get("tier_name"),
+                "block_reason": asp_result.get("block_reason"),
+            }
+        )
+        if asp_result.get("status") == "ok":
+            flat = extract_quote_from_fetch_result(asp_result, sym)
+            html = asp_result.get("html") or ""
+
+    if need_browser:
         stealth = await fetch_stealth_browser(page_url, retailer_key=YAHOO_RETAILER_KEY)
-        meta["stealth_status"] = stealth.get("status")
-        meta["stealth_block_reason"] = stealth.get("block_reason")
-        meta["stealth_backend"] = stealth.get("fetch_backend")
-        if stealth.get("status") == "ok":
-            flat.update(extract_quote_from_fetch_result(stealth, sym))
-            html = stealth.get("html") or html
-    else:
-        stealth = asp_result
+    meta["stealth_status"] = stealth.get("status")
+    meta["stealth_block_reason"] = stealth.get("block_reason")
+    meta["stealth_backend"] = stealth.get("fetch_backend")
+    if stealth.get("status") == "ok":
+        flat.update(extract_quote_from_fetch_result(stealth, sym))
+        html = stealth.get("html") or html
+    elif need_browser and asp_result.get("status") != "ok":
+        meta["stealth_fallback"] = True
 
     if not modules:
         meta["browser_session_api"] = True
@@ -650,6 +949,14 @@ async def fetch_yahoo_via_asp(ticker: str) -> dict[str, Any]:
                 html = net.get("html") or html
         except Exception:
             logger.exception("Yahoo browser network capture failed for %s", sym)
+
+    if not modules and not _has_quote_price(flat):
+        meta["chart_api"] = True
+        chart = await fetch_yahoo_chart_http(sym)
+        chart_flat = chart.get("flat") or {}
+        if chart_flat:
+            flat.update(chart_flat)
+            meta["yahoo_api_source"] = chart.get("source")
 
     vision_source: str | None = None
     if not _yahoo_api_succeeded(modules):
@@ -844,12 +1151,39 @@ async def fetch_yahoo_full(
     if not force_refresh:
         cached = await cache.get(cache_key)
         if cached:
-            cached["cache_hit"] = True
-            if cached.get("data"):
-                cached["data"] = _strip_news_from_flat(cached["data"])
-            cached.pop("news", None)
-            cached.pop("news_count", None)
-            return cached
+            data = _strip_news_from_flat(cached.get("data") or {})
+            if is_valid_yahoo_quote(
+                sym, data, modules_fetched=cached.get("modules_fetched")
+            ):
+                cached["cache_hit"] = True
+                cached["data"] = data
+                cached.pop("news", None)
+                cached.pop("news_count", None)
+                if data and not cached.get("scorecard"):
+                    cached["scorecard"] = build_scorecard_from_flat(data)
+                return cached
+            await cache.invalidate(cache_key)
+            logger.warning(
+                "Invalid cached Yahoo quote for %s — evicting and refetching", sym
+            )
+
+    async with _yahoo_fetch_semaphore:
+        return await _fetch_yahoo_full_impl(
+            sym,
+            force_refresh=force_refresh,
+            include_html=include_html,
+            cache_key=cache_key,
+        )
+
+
+async def _fetch_yahoo_full_impl(
+    sym: str,
+    *,
+    force_refresh: bool,
+    include_html: bool,
+    cache_key: str,
+) -> dict[str, Any]:
+    from cache import cache
 
     asp = await fetch_yahoo_via_asp(sym)
     modules = asp.get("modules") or {}
@@ -865,7 +1199,7 @@ async def fetch_yahoo_full(
     elif asp_meta.get("vision_fallback"):
         attempts.append("vision_screenshot")
 
-    if not _has_quote_price(flat) and not asp_meta.get("vision_fallback"):
+    if not parse_flat_price_for_ticker(flat, sym) and not asp_meta.get("vision_fallback"):
         from app.services.crawler.compliant_fetcher import fetch_compliant
 
         if not html:
@@ -878,7 +1212,11 @@ async def fetch_yahoo_full(
             attempts.append("html_parse")
 
     # Safety net: API failed, vision was skipped/disabled, still no price
-    if not _yahoo_api_succeeded(modules) and not asp_meta.get("vision_fallback_ok"):
+    if (
+        not parse_flat_price_for_ticker(flat, sym)
+        and not _yahoo_api_succeeded(modules)
+        and not asp_meta.get("vision_fallback_ok")
+    ):
         flat, vision_source = await _run_vision_fallback(sym, flat, asp_meta)
         if vision_source:
             source = vision_source
@@ -886,9 +1224,10 @@ async def fetch_yahoo_full(
         asp_meta = {**asp_meta}
 
     module_names = [k for k in modules.keys() if k != "symbol"] if modules else []
-    flat = _strip_news_from_flat(flat)
+    flat = _sanitize_flat_for_ticker(_strip_news_from_flat(flat), sym)
+    quote_ok = is_valid_yahoo_quote(sym, flat, modules_fetched=module_names)
     result: dict[str, Any] = {
-        "ok": bool(flat),
+        "ok": quote_ok,
         "ticker": sym,
         "url": f"https://finance.yahoo.com/quote/{sym}/",
         "source": source or "none",
@@ -898,6 +1237,7 @@ async def fetch_yahoo_full(
         "modules_fetched": module_names,
         "field_count": len(flat),
         "data": flat,
+        "scorecard": build_scorecard_from_flat(flat),
     }
     if include_html and html:
         result["html"] = html[:350_000]
@@ -909,8 +1249,11 @@ async def fetch_yahoo_full(
 
     if result["ok"]:
         await cache.set(cache_key, result)
-
-    if not result["ok"]:
-        result["error"] = "yahoo_data_not_found"
+    else:
+        result["error"] = (
+            "yahoo_quote_invalid"
+            if flat
+            else "yahoo_data_not_found"
+        )
 
     return result

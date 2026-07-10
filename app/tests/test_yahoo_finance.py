@@ -4,11 +4,15 @@ import unittest
 
 from app.services.yahoo_finance import (
     _merge_flat_with_vision,
+    _sanitize_flat_for_ticker,
     _strip_news_from_flat,
     _yahoo_api_succeeded,
+    build_scorecard_from_flat,
     extract_quote_from_fetch_result,
     flatten_yahoo_modules,
+    is_valid_yahoo_quote,
     parse_fin_streamers_from_html,
+    parse_flat_price_for_ticker,
     parse_news_articles_from_html,
     parse_price_for_symbol,
     parse_yahoo_regular_price,
@@ -82,6 +86,43 @@ class TestYahooFinance(unittest.TestCase):
         self.assertEqual(merged["vision.regularMarketPrice"], 47.41)
         self.assertNotIn("asp.regularMarketPrice", merged)
 
+    def test_parse_flat_price_rejects_unscoped_asp_bleed(self):
+        flat = {"asp.regularMarketPrice": 63411.7}
+        self.assertIsNone(parse_flat_price_for_ticker(flat, "MSFT"))
+
+    def test_parse_flat_price_rejects_wrong_asp_ticker(self):
+        flat = {"asp.regularMarketPrice": 62361.87, "asp.ticker": "BTC-USD"}
+        self.assertIsNone(parse_flat_price_for_ticker(flat, "MSFT"))
+
+    def test_parse_flat_price_accepts_api_module_price(self):
+        flat = {
+            "price.regularMarketPrice": 412.5,
+            "price.symbol": "MSFT",
+            "asp.regularMarketPrice": 63411.7,
+        }
+        self.assertEqual(parse_flat_price_for_ticker(flat, "MSFT"), 412.5)
+
+    def test_parse_flat_price_accepts_scoped_html(self):
+        flat = {"html.regularMarketPrice": 412.5}
+        self.assertEqual(parse_flat_price_for_ticker(flat, "MSFT"), 412.5)
+
+    def test_sanitize_flat_strips_unscoped_asp(self):
+        flat = {
+            "asp.regularMarketPrice": 63411.7,
+            "html.regularMarketPrice": 412.5,
+        }
+        cleaned = _sanitize_flat_for_ticker(flat, "MSFT")
+        self.assertNotIn("asp.regularMarketPrice", cleaned)
+        self.assertEqual(cleaned["html.regularMarketPrice"], 412.5)
+
+    def test_is_valid_yahoo_quote_false_for_bleed_only(self):
+        flat = {"asp.regularMarketPrice": 63411.7}
+        self.assertFalse(is_valid_yahoo_quote("MSFT", flat))
+
+    def test_is_valid_yahoo_quote_true_for_api_price(self):
+        flat = {"price.regularMarketPrice": 412.5, "price.symbol": "MSFT"}
+        self.assertTrue(is_valid_yahoo_quote("MSFT", flat))
+
     def test_strip_news_from_flat(self):
         flat = {
             "vision.regularMarketPrice": 47.41,
@@ -98,6 +139,35 @@ class TestYahooFinance(unittest.TestCase):
         articles = parse_news_articles_from_html(html, limit=3)
         self.assertEqual(len(articles), 1)
         self.assertIn("Apple", articles[0]["title"])
+
+    def test_build_scorecard_from_flat_api_fields(self):
+        flat = {
+            "financialData.freeCashflow": 50_000_000_000,
+            "financialData.totalDebt": 80_000_000_000,
+            "financialData.profitMargins": 0.35,
+            "financialData.currentRatio": 1.8,
+            "financialData.operatingCashflow": 90_000_000_000,
+            "financialData.totalCash": 20_000_000_000,
+        }
+        scorecard = build_scorecard_from_flat(flat)
+        self.assertEqual(scorecard["fcf"], 50_000_000_000)
+        self.assertEqual(scorecard["debt"], 80_000_000_000)
+        self.assertEqual(scorecard["margin"], 0.35)
+        self.assertEqual(scorecard["current_ratio"], 1.8)
+        self.assertEqual(scorecard["moat_source"], "agent_required")
+        self.assertIsNotNone(scorecard["roic"])
+
+    def test_build_scorecard_from_vision_fields(self):
+        flat = {
+            "vision.financial_highlights.freeCashflow": 1.2e9,
+            "vision.financial_highlights.totalDebt": 2.5e9,
+            "vision.financial_highlights.profitMargins": 0.12,
+            "vision.statistics.currentRatio": 2.1,
+        }
+        scorecard = build_scorecard_from_flat(flat)
+        self.assertEqual(scorecard["fcf"], 1.2e9)
+        self.assertEqual(scorecard["current_ratio"], 2.1)
+        self.assertEqual(scorecard["populated_count"], 4)
 
 
 if __name__ == "__main__":

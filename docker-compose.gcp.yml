@@ -48,6 +48,8 @@ services:
       BROWSER_PROXY_MAX_RETRIES: "2"
       ANTIBOT_MAX_ATTEMPTS: "2"
       BROWSER_GRID_TIMEOUT_SECONDS: "75"
+      YAHOO_USE_CURL_CFFI: "true"
+      YAHOO_CURL_IMPERSONATE: "chrome124"
     depends_on:
       postgres:
         condition: service_healthy

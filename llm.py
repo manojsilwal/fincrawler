@@ -1,7 +1,12 @@
 # llm.py
 """
-LLM client wrapping the NVIDIA-hosted DeepSeek v4 Pro model
-via the OpenAI-compatible API.
+LLM client via OpenAI-compatible APIs.
+
+Cascade (same order as TradeTalk ``LLMClient``):
+  1. NVIDIA Build
+  2. OpenRouter
+  3. GitHub Models
+  4. Gemini (OpenAI-compat endpoint)
 
 All external LLM calls in FinCrawler go through this module so that
 the model/provider can be swapped in a single place.
@@ -12,45 +17,291 @@ import json
 import logging
 import os
 import re
+from dataclasses import dataclass
 from typing import Optional, Type
 
 from dotenv import load_dotenv
 load_dotenv()
 
-from openai import AsyncOpenAI, RateLimitError
+from openai import APIStatusError, AsyncOpenAI, RateLimitError
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Client singleton
+# Provider cascade — NVIDIA → OpenRouter → GitHub Models → Gemini
 # ---------------------------------------------------------------------------
-_client: Optional[AsyncOpenAI] = None
-_llm_semaphore = asyncio.Semaphore(1)  # Prevent NVIDIA API 429 Too Many Requests
+_llm_semaphore = asyncio.Semaphore(1)
+_clients: dict[str, AsyncOpenAI] = {}
 
 
-def _get_client() -> AsyncOpenAI:
-    global _client
-    if _client is None:
-        api_key = os.getenv("LLM_API_KEY", "") or os.getenv("OPENROUTER_KEY", "") or os.getenv("OPENROUTER_API_KEY", "")
-        base_url = os.getenv("LLM_BASE_URL", "https://integrate.api.nvidia.com/v1")
-        if not api_key:
-            raise RuntimeError(
-                "LLM_API_KEY environment variable is not set. "
-                "Add it to your .env file."
-            )
-        _client = AsyncOpenAI(api_key=api_key, base_url=base_url)
-        logger.info("LLM client initialised (base_url=%s)", base_url)
-    return _client
+@dataclass(frozen=True)
+class _Provider:
+    name: str
+    client: AsyncOpenAI
+    model: str
+    max_tokens: int
+
+
+def _reset_llm_clients() -> None:
+    """Test helper — clear cached OpenAI clients."""
+    _clients.clear()
+
+
+def _client_for(name: str, api_key: str, base_url: str) -> AsyncOpenAI:
+    key = f"{name}|{base_url}|{api_key[:8]}"
+    if key not in _clients:
+        _clients[key] = AsyncOpenAI(api_key=api_key, base_url=base_url.rstrip("/"))
+        logger.info("LLM %s client initialised (base_url=%s)", name, base_url)
+    return _clients[key]
+
+
+def _openrouter_key() -> str:
+    return (
+        os.getenv("LLM_API_KEY", "").strip()
+        or os.getenv("OPENROUTER_KEY", "").strip()
+        or os.getenv("OPENROUTER_API_KEY", "").strip()
+    )
+
+
+def _nvidia_key() -> str:
+    return (
+        os.getenv("LLM_FALLBACK_API_KEY", "").strip()
+        or os.getenv("NVIDIA_API_KEY", "").strip()
+    )
+
+
+def _github_key() -> str:
+    return (
+        os.getenv("GITHUB_MODELS_TOKEN", "").strip()
+        or os.getenv("GITHUB_TOKEN", "").strip()
+    )
+
+
+def _gemini_key() -> str:
+    return (
+        os.getenv("GEMINI_API_KEY", "").strip()
+        or os.getenv("GOOGLE_API_KEY", "").strip()
+    )
 
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-_MODEL = os.getenv("LLM_MODEL", "deepseek-ai/deepseek-v4-pro")
-_FALLBACK_MODEL = os.getenv("LLM_FALLBACK_MODEL", "deepseek-ai/deepseek-v4-flash")
+_DEFAULT_MODEL = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
+_MODEL = os.getenv("LLM_MODEL", _DEFAULT_MODEL)
+# Same-provider retry model (OpenRouter); provider fallback uses NVIDIA vars below.
+_FALLBACK_MODEL = os.getenv("LLM_FALLBACK_MODEL", _DEFAULT_MODEL)
+_FALLBACK_PROVIDER_MODEL = os.getenv("LLM_FALLBACK_PROVIDER_MODEL", "minimaxai/minimax-m3")
+_FALLBACK_VISION_MODEL = os.getenv(
+    "LLM_FALLBACK_VISION_MODEL", _FALLBACK_PROVIDER_MODEL
+)
+_FALLBACK_MAX_TOKENS = int(os.getenv("LLM_FALLBACK_MAX_TOKENS", "8192"))
 _MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "16384"))
 _TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.1"))  # low for factual extraction
+
+_GITHUB_MODELS_BASE_URL = os.getenv(
+    "GITHUB_MODELS_BASE_URL", "https://models.github.ai/inference"
+).rstrip("/")
+_GITHUB_MODELS_MODEL = os.getenv("GITHUB_MODELS_MODEL", "openai/gpt-4o-mini")
+_GEMINI_BASE_URL = os.getenv(
+    "GEMINI_OPENAI_BASE_URL",
+    "https://generativelanguage.googleapis.com/v1beta/openai/",
+).rstrip("/") + "/"
+_GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
+
+
+def _ordered_providers(*, vision: bool = False) -> list[_Provider]:
+    """
+    Build the try-order matching TradeTalk LLMClient:
+    NVIDIA → OpenRouter → GitHub Models → Gemini.
+    """
+    providers: list[_Provider] = []
+
+    nv_key = _nvidia_key()
+    if nv_key:
+        base = os.getenv(
+            "LLM_FALLBACK_BASE_URL", "https://integrate.api.nvidia.com/v1"
+        ).strip()
+        model = _FALLBACK_VISION_MODEL if vision else _FALLBACK_PROVIDER_MODEL
+        providers.append(
+            _Provider(
+                "nvidia",
+                _client_for("nvidia", nv_key, base),
+                model,
+                _FALLBACK_MAX_TOKENS,
+            )
+        )
+
+    or_key = _openrouter_key()
+    if or_key:
+        base = os.getenv("LLM_BASE_URL", "https://openrouter.ai/api/v1")
+        model = (
+            (_resolve_vision_model() if vision else _MODEL)
+        )
+        providers.append(
+            _Provider(
+                "openrouter",
+                _client_for("openrouter", or_key, base),
+                model,
+                _MAX_TOKENS,
+            )
+        )
+
+    gh_key = _github_key()
+    if gh_key:
+        providers.append(
+            _Provider(
+                "github",
+                _client_for("github", gh_key, _GITHUB_MODELS_BASE_URL),
+                _GITHUB_MODELS_MODEL,
+                min(_MAX_TOKENS, 4096),
+            )
+        )
+
+    gem_key = _gemini_key()
+    if gem_key:
+        providers.append(
+            _Provider(
+                "gemini",
+                _client_for("gemini", gem_key, _GEMINI_BASE_URL),
+                _GEMINI_MODEL,
+                _MAX_TOKENS,
+            )
+        )
+
+    return providers
+
+
+def _get_primary_client() -> AsyncOpenAI:
+    """Backward-compatible: first configured provider client (raises if none)."""
+    providers = _ordered_providers()
+    if not providers:
+        raise RuntimeError(
+            "No LLM provider configured. Set NVIDIA_API_KEY, LLM_API_KEY / "
+            "OPENROUTER_API_KEY, GITHUB_MODELS_TOKEN / GITHUB_TOKEN, or GEMINI_API_KEY."
+        )
+    return providers[0].client
+
+
+def _get_fallback_client() -> Optional[AsyncOpenAI]:
+    """Backward-compatible: second provider client if present."""
+    providers = _ordered_providers()
+    if len(providers) < 2:
+        return None
+    return providers[1].client
+
+
+def _get_client() -> AsyncOpenAI:
+    """Backward-compatible alias for primary client."""
+    return _get_primary_client()
+
+
+def _should_use_nvidia_fallback(exc: BaseException) -> bool:
+    """True when a provider error should trigger cascade to the next provider."""
+    if isinstance(exc, RateLimitError):
+        return True
+    if isinstance(exc, APIStatusError):
+        return exc.status_code in (401, 402, 403, 429, 500, 502, 503)
+    msg = str(exc).lower()
+    return any(
+        token in msg
+        for token in (
+            "rate limit",
+            "rate_limit",
+            "too many requests",
+            "payment required",
+            "insufficient credits",
+            "requires more credits",
+            "unauthorized",
+            "forbidden",
+            "temporarily unavailable",
+        )
+    )
+
+
+# Alias used by tests / callers that still say "nvidia fallback"
+_should_failover = _should_use_nvidia_fallback
+
+
+async def _create_chat_completion(
+    *,
+    messages: list,
+    model: str | None = None,
+    max_tokens: int | None = None,
+    temperature: float | None = None,
+    vision: bool = False,
+):
+    """
+    Try providers in order: NVIDIA → OpenRouter → GitHub Models → Gemini.
+    ``model`` overrides the first matching OpenRouter model when provided.
+    """
+    temperature = _TEMPERATURE if temperature is None else temperature
+    providers = _ordered_providers(vision=vision)
+    if not providers:
+        raise RuntimeError(
+            "No LLM provider configured. Set NVIDIA_API_KEY, OPENROUTER_API_KEY / "
+            "LLM_API_KEY, GITHUB_MODELS_TOKEN, or GEMINI_API_KEY."
+        )
+
+    last_exc: BaseException | None = None
+    for idx, prov in enumerate(providers):
+        use_model = prov.model
+        # Honor explicit model override on OpenRouter slot
+        if model and prov.name == "openrouter":
+            use_model = model
+        use_max = max_tokens if max_tokens is not None else prov.max_tokens
+        try:
+            async with _llm_semaphore:
+                resp = await prov.client.chat.completions.create(
+                    model=use_model,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=use_max,
+                    stream=False,
+                )
+            if idx > 0:
+                logger.info(
+                    "LLM cascade succeeded on provider=%s model=%s (after %d prior failure(s))",
+                    prov.name,
+                    use_model,
+                    idx,
+                )
+            return resp
+        except Exception as exc:
+            last_exc = exc
+            has_next = idx < len(providers) - 1
+            if has_next and _should_use_nvidia_fallback(exc):
+                logger.warning(
+                    "LLM provider=%s model=%s failed (%s) — trying next in cascade",
+                    prov.name,
+                    use_model,
+                    exc,
+                )
+                continue
+            if has_next:
+                # Soft-fail other errors too so GitHub/Gemini still get a chance
+                logger.warning(
+                    "LLM provider=%s model=%s failed (%s) — trying next in cascade",
+                    prov.name,
+                    use_model,
+                    exc,
+                )
+                continue
+            raise
+
+    assert last_exc is not None
+    raise last_exc
+
+
+def _resolve_vision_model() -> str:
+    """Vision/screenshot extraction model — defaults to LLM_MODEL."""
+    return (
+        os.getenv("VISION_LLM_MODEL", "").strip()
+        or os.getenv("LLM_VISION_MODEL", "").strip()
+        or os.getenv("LLM_MODEL", "").strip()
+        or _MODEL
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -63,6 +314,12 @@ Return ONLY a valid JSON object matching the user's schema.
 Never invent data. If a field cannot be found, use null.
 Do not include markdown fences, explanations, or any text outside the JSON object."""
 
+_VISION_SYSTEM_PROMPT = """You are a precise financial data extraction assistant reading web page screenshots.
+Extract only values clearly visible in the images.
+Return ONLY one valid JSON object — no markdown fences, no commentary, no reasoning text, no preamble.
+Never invent data. Use null for fields not visible.
+Your entire reply must be parseable as JSON starting with { and ending with }."""
+
 _SHOP_SYSTEM_PROMPT = """You are a precise e-commerce data extraction assistant.
 Given retail search page text, extract product and price information accurately.
 Return ONLY a single valid JSON object — no markdown fences, no commentary.
@@ -72,7 +329,7 @@ The price field must be a number (USD), not a string like "$419.00"."""
 
 
 def _message_text(message) -> str:
-    """Collect LLM output; reasoning models (e.g. minimax-m3) may use alternate fields."""
+    """Collect LLM output; reasoning models (e.g. Nemotron) may use alternate fields."""
     content = (getattr(message, "content", None) or "").strip()
     if content:
         return content
@@ -93,6 +350,56 @@ def _message_text(message) -> str:
         if parts:
             return "\n".join(parts)
     return content
+
+
+def _message_candidates_for_json(message) -> list[str]:
+    """
+    Candidate strings to parse as JSON.
+
+    Reasoning models often leave ``content`` empty and put chain-of-thought in
+    ``reasoning`` while the JSON (if any) may live in either field.
+    """
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def _add(val: str | None) -> None:
+        text = (val or "").strip()
+        if text and text not in seen:
+            seen.add(text)
+            candidates.append(text)
+
+    _add(getattr(message, "content", None))
+    for attr in ("reasoning", "reasoning_content"):
+        _add(getattr(message, attr, None))
+    details = getattr(message, "reasoning_details", None)
+    if isinstance(details, list):
+        parts = []
+        for item in details:
+            if isinstance(item, dict):
+                text = item.get("text") or item.get("content") or ""
+                if text:
+                    parts.append(str(text))
+            elif isinstance(item, str):
+                parts.append(item)
+        if parts:
+            _add("\n".join(parts))
+    return candidates
+
+
+async def _create_vision_chat_completion(
+    *,
+    messages: list,
+    model: str,
+    use_nvidia_fallback: bool = False,
+):
+    """Vision chat completion via the full provider cascade."""
+    # ``use_nvidia_fallback`` kept for call-site compat; cascade already includes NVIDIA+.
+    _ = use_nvidia_fallback
+    return await _create_chat_completion(
+        messages=messages,
+        model=model,
+        vision=True,
+    )
 
 
 async def extract_from_screenshot(
@@ -155,12 +462,7 @@ async def extract_from_screenshots(
     if not images:
         return {"_error": "no screenshots provided", "_llm_raw": None}
 
-    client = _get_client()
-    model = os.getenv("VISION_LLM_MODEL", "") or os.getenv("LLM_VISION_MODEL", "")
-    if not model:
-        model = os.getenv("LLM_MODEL", "") or _MODEL
-        if os.getenv("LLM_BASE_URL", "").find("openrouter") >= 0 and model == _MODEL:
-            model = "google/gemini-3.5-flash"
+    model = _resolve_vision_model()
 
     batch_size = int(os.getenv("VISION_SCREENSHOTS_PER_BATCH", "6"))
     if len(images) <= batch_size:
@@ -170,13 +472,13 @@ async def extract_from_screenshots(
         batches = [images[i : i + batch_size] for i in range(0, len(images), batch_size)]
         batch_offsets = list(range(0, len(images), batch_size))
 
-    system_content = _SHOP_SYSTEM_PROMPT if task == "shopping" else _SYSTEM_PROMPT
+    system_content = _SHOP_SYSTEM_PROMPT if task == "shopping" else _VISION_SYSTEM_PROMPT
     if extra_context:
         system_content += f"\n\nAdditional context: {extra_context}"
     system_content += (
         "\n\nYou are reading sequential viewport screenshots of the same web page "
         "scrolled from top to bottom. Merge all visible data into one JSON object. "
-        "Extract only values clearly visible. Return JSON only."
+        "Extract only values clearly visible. Reply with JSON only — no other text."
     )
 
     partials: list[dict] = []
@@ -189,7 +491,8 @@ async def extract_from_screenshots(
                 "text": (
                     f"Instruction: {prompt}\n\n"
                     f"These are {panel_range} (top to bottom). "
-                    "Combine data from all images; do not duplicate list items."
+                    "Combine data from all images; do not duplicate list items. "
+                    "Respond with a single JSON object only."
                 ),
             },
         ]
@@ -208,28 +511,59 @@ async def extract_from_screenshots(
                 }
             )
 
-        try:
-            async with _llm_semaphore:
-                response = await client.chat.completions.create(
+        messages = [
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": user_content},
+        ]
+        parsed: dict | None = None
+        last_raw = ""
+        for attempt, use_fb in enumerate((False, True)):
+            if attempt == 1 and _get_fallback_client() is None:
+                break
+            try:
+                response = await _create_vision_chat_completion(
+                    messages=messages,
                     model=model,
-                    messages=[
-                        {"role": "system", "content": system_content},
-                        {"role": "user", "content": user_content},
-                    ],
-                    temperature=_TEMPERATURE,
-                    max_tokens=_MAX_TOKENS,
+                    use_nvidia_fallback=use_fb,
                 )
-            raw = _message_text(response.choices[0].message)
-            logger.info(
-                "Vision LLM extract | model=%s panels=%s response_chars=%d",
-                model,
-                panel_range,
-                len(raw),
-            )
-            partials.append(_parse_json_response(raw))
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("Vision LLM extraction failed for %s", panel_range)
-            partials.append({"_error": str(exc), "_llm_raw": None})
+                message = response.choices[0].message
+                candidates = _message_candidates_for_json(message)
+                last_raw = candidates[0] if candidates else _message_text(message)
+                for candidate in candidates or [last_raw]:
+                    parsed = _parse_json_response(candidate)
+                    if not parsed.get("_error"):
+                        last_raw = candidate
+                        break
+                logger.info(
+                    "Vision LLM extract | model=%s panels=%s attempt=%d response_chars=%d parsed=%s",
+                    _FALLBACK_VISION_MODEL if use_fb else model,
+                    panel_range,
+                    attempt + 1,
+                    len(last_raw),
+                    "ok" if parsed and not parsed.get("_error") else "failed",
+                )
+                if parsed and not parsed.get("_error"):
+                    break
+                if attempt == 0 and parsed and parsed.get("_error") == "json_parse_failed":
+                    logger.warning(
+                        "Vision JSON parse failed for %s — retrying with NVIDIA fallback",
+                        panel_range,
+                    )
+                    continue
+                break
+            except Exception as exc:  # noqa: BLE001
+                if attempt == 0 and _get_fallback_client() is not None:
+                    logger.warning(
+                        "Vision LLM failed for %s (%s) — retrying with NVIDIA fallback",
+                        panel_range,
+                        exc,
+                    )
+                    continue
+                logger.exception("Vision LLM extraction failed for %s", panel_range)
+                parsed = {"_error": str(exc), "_llm_raw": None}
+                break
+
+        partials.append(parsed or {"_error": "json_parse_failed", "_llm_raw": last_raw})
 
     if len(partials) == 1:
         return partials[0]
@@ -266,7 +600,6 @@ async def extract_structured(
     -------
     dict — always a dict; may contain an ``_error`` key on failure.
     """
-    client = _get_client()
     model = _MODEL
 
     # Build the schema hint
@@ -295,25 +628,25 @@ async def extract_structured(
     base_delay = 8
 
     for attempt in range(max_retries):
-        current_model = model
-        # Use fallback on 2nd and 3rd attempt if we get rate limited
-        if attempt > 0 and _FALLBACK_MODEL:
-            current_model = _FALLBACK_MODEL
+        current_model = model if attempt == 0 else _FALLBACK_MODEL
 
-        logger.info("LLM extract | model=%s attempt=%d/%d prompt_chars=%d", current_model, attempt + 1, max_retries, len(user_content))
+        logger.info(
+            "LLM extract | model=%s attempt=%d/%d prompt_chars=%d",
+            current_model,
+            attempt + 1,
+            max_retries,
+            len(user_content),
+        )
 
         try:
-            async with _llm_semaphore:
-                response = await client.chat.completions.create(
-                    model=current_model,
-                    messages=[
-                        {"role": "system", "content": system_content},
-                        {"role": "user", "content": user_content},
-                    ],
-                    temperature=_TEMPERATURE,
-                    max_tokens=_MAX_TOKENS,
-                    stream=False,
-                )
+            response = await _create_chat_completion(
+                messages=[
+                    {"role": "system", "content": system_content},
+                    {"role": "user", "content": user_content},
+                ],
+                model=current_model,
+                vision=False,
+            )
 
             raw = _message_text(response.choices[0].message)
             logger.info("LLM raw response: %s", raw[:500])
@@ -322,7 +655,13 @@ async def extract_structured(
         except RateLimitError as exc:
             if attempt < max_retries - 1:
                 delay = base_delay * (2 ** attempt)
-                logger.warning(f"LLM %s rate limited, retrying in %ds (attempt %d/%d)", current_model, delay, attempt + 1, max_retries)
+                logger.warning(
+                    "LLM %s rate limited, retrying in %ds (attempt %d/%d)",
+                    current_model,
+                    delay,
+                    attempt + 1,
+                    max_retries,
+                )
                 await asyncio.sleep(delay)
             else:
                 logger.exception("LLM extraction failed after max retries (Rate Limit)")
@@ -333,35 +672,73 @@ async def extract_structured(
 
 
 
+def _extract_json_objects(text: str) -> list[str]:
+    """Find balanced {...} substrings in *text*, largest first."""
+    if not text or "{" not in text:
+        return []
+    found: list[str] = []
+    i = 0
+    while i < len(text):
+        if text[i] != "{":
+            i += 1
+            continue
+        depth = 0
+        in_string = False
+        escape = False
+        start = i
+        for j in range(i, len(text)):
+            ch = text[j]
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                continue
+            if ch == '"':
+                in_string = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    found.append(text[start : j + 1])
+                    i = j + 1
+                    break
+        else:
+            i += 1
+    found.sort(key=len, reverse=True)
+    return found
+
+
 def _parse_json_response(raw: str) -> dict:
     """
     Robustly parse JSON from LLM output.
-    Handles markdown fences, leading text, trailing garbage.
+    Handles markdown fences, leading text, trailing garbage, reasoning prose.
     """
+    if not raw or not raw.strip():
+        return {"_error": "json_parse_failed", "_llm_raw": raw}
+
     # Strip markdown fences if present
     cleaned = re.sub(r"```(?:json)?\s*", "", raw).strip().rstrip("`").strip()
 
     # Fix common trailing commas before array/object closing brackets
     cleaned = re.sub(r",\s*([\]}])", r"\1", cleaned)
 
-    # Try direct parse
-    try:
-        result = json.loads(cleaned)
-        if isinstance(result, dict):
-            return result
-        return {"result": result}
-    except json.JSONDecodeError:
-        pass
+    attempts = [cleaned]
+    attempts.extend(_extract_json_objects(cleaned))
 
-    # Try to find a JSON object anywhere in the string
-    m = re.search(r"\{.*\}", cleaned, re.DOTALL)
-    if m:
+    for candidate in attempts:
+        if not candidate:
+            continue
         try:
-            result = json.loads(m.group(0))
+            result = json.loads(candidate)
             if isinstance(result, dict):
                 return result
+            return {"result": result}
         except json.JSONDecodeError:
-            pass
+            continue
 
     salvaged = _salvage_partial_json(cleaned)
     if salvaged:
@@ -377,19 +754,45 @@ def _salvage_partial_json(raw: str) -> dict | None:
     if not raw or "{" not in raw:
         return None
     out: dict = {}
-    for key in ("product_name", "title", "availability", "seller"):
-        m = re.search(rf'"{key}"\s*:\s*"((?:[^"\\]|\\.)*)"', raw)
+    for key in ("product_name", "title", "availability", "seller", "company_name", "ticker"):
+        m = re.search(rf'"{re.escape(key)}"\s*:\s*"((?:[^"\\]|\\.)*)"', raw)
         if m:
             out[key] = m.group(1).replace('\\"', '"')
-    for key in ("price", "original_price", "rating", "review_count"):
-        m = re.search(rf'"{key}"\s*:\s*([\d.]+)', raw)
+    for key in ("price", "original_price", "rating", "review_count", "regularMarketPrice"):
+        m = re.search(rf'"{re.escape(key)}"\s*:\s*([\d.]+)', raw)
         if m:
             try:
                 out[key] = float(m.group(1))
             except ValueError:
                 pass
+    # Nested quote_header.regularMarketPrice
+    m = re.search(
+        r'"quote_header"\s*:\s*\{([^}]*)',
+        raw,
+        re.DOTALL,
+    )
+    if m:
+        block = m.group(1)
+        qh: dict = {}
+        tm = re.search(r'"ticker"\s*:\s*"([^"]+)"', block)
+        if tm:
+            qh["ticker"] = tm.group(1)
+        pm = re.search(r'"regularMarketPrice"\s*:\s*([\d.]+)', block)
+        if pm:
+            qh["regularMarketPrice"] = float(pm.group(1))
+        if qh:
+            out["quote_header"] = qh
     if out.get("price") or out.get("product_name") or out.get("title"):
         return out
+    if out.get("quote_header"):
+        return out
+    if out.get("regularMarketPrice") or out.get("ticker"):
+        qh = {
+            k: out[k]
+            for k in ("regularMarketPrice", "ticker", "company_name")
+            if out.get(k) is not None
+        }
+        return {"quote_header": qh}
     return None
 
 
@@ -398,16 +801,18 @@ def _salvage_partial_json(raw: str) -> dict | None:
 # ---------------------------------------------------------------------------
 
 async def llm_health_check() -> bool:
-    """Returns True if the LLM endpoint is reachable."""
+    """Returns True if any cascade provider (NVIDIA→OpenRouter→GitHub→Gemini) is reachable."""
+    messages = [{"role": "user", "content": "Reply with the single word: ok"}]
     try:
-        client = _get_client()
-        resp = await client.chat.completions.create(
+        resp = await _create_chat_completion(
+            messages=messages,
             model=_MODEL,
-            messages=[{"role": "user", "content": "Reply with the single word: ok"}],
             max_tokens=25,
             temperature=0,
         )
-        # Handle reasoning models where content might be empty but reasoning/choices exist
-        return len(resp.choices) > 0 and (bool(resp.choices[0].message.content) or hasattr(resp.choices[0].message, 'reasoning'))
+        return len(resp.choices) > 0 and (
+            bool(resp.choices[0].message.content)
+            or hasattr(resp.choices[0].message, "reasoning")
+        )
     except Exception:
         return False

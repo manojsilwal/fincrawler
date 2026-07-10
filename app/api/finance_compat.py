@@ -72,6 +72,7 @@ class FullQuoteResponse(BaseModel):
     field_count: int = 0
     modules_fetched: list[str] = Field(default_factory=list)
     data: dict[str, Any] = Field(default_factory=dict)
+    scorecard: dict[str, Any] = Field(default_factory=dict)
     error: Optional[str] = None
 
 
@@ -113,24 +114,25 @@ async def _fetch_page_text(url: str) -> tuple[str, Optional[str]]:
         return "", str(exc)
 
 
-async def _fetch_yahoo_quote_price(url: str, symbol: str | None = None) -> tuple[Optional[float], Optional[str]]:
-    from app.services.yahoo_finance import fetch_yahoo_full, ticker_from_yahoo_url
+async def _fetch_yahoo_quote_price(
+    url: str, symbol: str | None = None, *, force_refresh: bool = False
+) -> tuple[Optional[float], Optional[str]]:
+    from app.services.yahoo_finance import (
+        fetch_yahoo_full,
+        parse_flat_price_for_ticker,
+        ticker_from_yahoo_url,
+    )
 
     sym = symbol or ticker_from_yahoo_url(url)
     if sym:
-        full = await fetch_yahoo_full(sym)
+        full = await fetch_yahoo_full(sym, force_refresh=force_refresh)
+        if not full.get("ok"):
+            return None, full.get("error") or "yahoo_fetch_failed"
         data = full.get("data") or {}
-        for key in (
-            "price.regularMarketPrice",
-            "asp.regularMarketPrice",
-            "dom.regularMarketPrice",
-            "vision.regularMarketPrice",
-            "regularMarketPrice",
-            "html.regularMarketPrice",
-        ):
-            val = data.get(key)
-            if isinstance(val, (int, float)) and val > 0:
-                return float(val), None
+        price = parse_flat_price_for_ticker(data, sym)
+        if price is not None and price > 0:
+            return float(price), None
+        return None, "price_not_found"
 
     html, err = await _fetch_page_text(url)
     if err and not html:
@@ -148,15 +150,19 @@ def _parse_news_articles(html: str, limit: int) -> list[dict[str, str]]:
 
 
 @router.get("/quote", response_model=QuoteResponse)
-async def quote_yahoo(ticker: str, _: None = Depends(_auth)):
+async def quote_yahoo(
+    ticker: str,
+    force_refresh: bool = False,
+    _: None = Depends(_auth),
+):
     sym = (ticker or "").upper().strip()
     if not sym:
         raise HTTPException(status_code=400, detail="ticker is required")
 
     url = f"https://finance.yahoo.com/quote/{sym}"
-    price, err = await _fetch_yahoo_quote_price(url)
+    price, err = await _fetch_yahoo_quote_price(url, sym, force_refresh=force_refresh)
     if err:
-        raise HTTPException(status_code=502, detail=err)
+        return QuoteResponse(ok=False, ticker=sym, error=err)
     if price is None:
         return QuoteResponse(ok=False, ticker=sym, error="price_not_found")
     return QuoteResponse(ok=True, ticker=sym, price=round(price, 4))
@@ -172,21 +178,19 @@ async def quote_smart(
     if not sym:
         raise HTTPException(status_code=400, detail="ticker is required")
 
-    from app.services.yahoo_finance import fetch_yahoo_full
+    from app.services.yahoo_finance import fetch_yahoo_full, parse_flat_price_for_ticker
 
     result = await fetch_yahoo_full(sym, force_refresh=force_refresh)
     if not result.get("ok"):
         raise HTTPException(status_code=502, detail=result.get("error", "extraction_failed"))
 
     raw = result.get("data") or {}
+    validated_price = parse_flat_price_for_ticker(raw, sym)
+    if validated_price is None:
+        raise HTTPException(status_code=502, detail="yahoo_quote_invalid")
+
     mapped = {
-        "regularMarketPrice": (
-            raw.get("price.regularMarketPrice")
-            or raw.get("vision.regularMarketPrice")
-            or raw.get("vision.quote_header.regularMarketPrice")
-            or raw.get("asp.regularMarketPrice")
-            or raw.get("html.regularMarketPrice")
-        ),
+        "regularMarketPrice": validated_price,
         "regularMarketChangePercent": (
             raw.get("price.regularMarketChangePercent")
             or raw.get("vision.quote_header.regularMarketChangePercent")
@@ -256,6 +260,10 @@ async def quote_full(
         raise HTTPException(status_code=502, detail=result.get("error", "yahoo_fetch_failed"))
 
     payload = {k: result.get(k) for k in FullQuoteResponse.model_fields if k in result}
+    if "scorecard" not in payload and result.get("data"):
+        from app.services.yahoo_finance import build_scorecard_from_flat
+
+        payload["scorecard"] = build_scorecard_from_flat(result["data"])
     if include_html and result.get("html"):
         payload["html"] = result["html"]
     return FullQuoteResponse(**payload)
@@ -397,18 +405,13 @@ async def scrape_compat(req: ScrapeRequest, _: None = Depends(_auth)):
         if sym:
             yahoo = await fetch_yahoo_full(sym, force_refresh=req.force_refresh)
             if yahoo.get("ok"):
-                return {
-                    "url": target_url,
-                    "status": "ok",
-                    "status_code": 200,
-                    "title": yahoo.get("data", {}).get("price.shortName") or sym,
-                    "ticker": sym,
-                    "source": yahoo.get("source"),
-                    "field_count": yahoo.get("field_count", 0),
-                    "modules_fetched": yahoo.get("modules_fetched", []),
-                    "yahoo_data": yahoo.get("data", {}),
-                    "excerpt": json.dumps(yahoo.get("data", {}))[:2000],
-                }
+                from app.services.yahoo_finance import build_yahoo_scrape_response
+
+                return build_yahoo_scrape_response(target_url, sym, yahoo)
+            raise HTTPException(
+                status_code=502,
+                detail=yahoo.get("error") or "yahoo_fetch_failed",
+            )
 
     if not req.force_refresh:
         cached = await cache.get(target_url)

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import os
 import uuid
+from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 from pydantic import BaseModel, Field
@@ -35,11 +37,28 @@ class CrawlRequest(BaseModel):
     url: str
     retailer_key: str | None = None
     max_bytes: int | None = Field(default=350_000)
+    force_refresh: bool = False
+
+
+def _yahoo_scrape_payload(target_url: str, sym: str, yahoo: dict[str, Any]) -> dict[str, Any]:
+    from app.services.yahoo_finance import build_yahoo_scrape_response
+
+    return build_yahoo_scrape_response(target_url, sym, yahoo)
 
 
 @router.post("/crawl")
 @router.post("/scrape")
 async def crawl_compat(body: CrawlRequest, db: Session = Depends(get_db), _: None = Depends(_auth)):
+    from app.services.yahoo_finance import fetch_yahoo_full, is_yahoo_quote_url, ticker_from_yahoo_url
+
+    target_url = (body.url or "").strip()
+    if is_yahoo_quote_url(target_url):
+        sym = ticker_from_yahoo_url(target_url)
+        if sym:
+            yahoo = await fetch_yahoo_full(sym, force_refresh=body.force_refresh)
+            if yahoo.get("ok"):
+                return _yahoo_scrape_payload(target_url, sym, yahoo)
+
     source = None
     if body.retailer_key:
         source = _registry.get_by_retailer(db, body.retailer_key)
@@ -50,7 +69,7 @@ async def crawl_compat(body: CrawlRequest, db: Session = Depends(get_db), _: Non
     if not source:
         raise HTTPException(400, "no active source configured")
 
-    result = await hybrid_router.fetch(db, source, body.url)
+    result = await hybrid_router.fetch(db, source, target_url or body.url)
     from app.services.asp.detector import is_usable_scrape
     from app.services.crawler.vision_fetcher import maybe_apply_vision_fallback, vision_fallback_enabled
 
@@ -60,14 +79,14 @@ async def crawl_compat(body: CrawlRequest, db: Session = Depends(get_db), _: Non
         if needs_vision:
             result = await maybe_apply_vision_fallback(
                 result,
-                body.url,
+                target_url or body.url,
                 retailer_key=retailer_key,
                 task="shopping" if retailer_key else "finance",
             )
 
     html = result.get("html") or result.get("text") or ""
     payload = {
-        "url": result.get("url", body.url),
+        "url": result.get("url", target_url or body.url),
         "status_code": result.get("http_status"),
         "title": result.get("title"),
         "excerpt": (result.get("text") or "")[:2000],

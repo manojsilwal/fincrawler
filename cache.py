@@ -31,6 +31,8 @@ class CrawlCache:
             "sec.gov":          86400,   # SEC filings        — 24 hours
             "earningswhispers": 3600,    # Earnings calendar  — 1 hour
             "finance.yahoo":    300,     # Yahoo quotes       — 5 minutes
+            "yahoo:full":       1800,    # Cached full quotes — 30 minutes
+            "yahoo:news":       900,    # Cached news        — 15 minutes
             "marketwatch":      300,     # Market data        — 5 minutes
             "seekingalpha":     1800,    # News articles      — 30 minutes
             "wsj.com":          600,     # WSJ                — 10 minutes
