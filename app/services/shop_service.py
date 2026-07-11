@@ -11,7 +11,7 @@ from decimal import Decimal
 
 from sqlalchemy.orm import Session
 
-from app.services.crawler.html_product_extractor import extract_product_fields
+from app.services.crawler.html_product_extractor import extract_product_fields_with_heal
 from app.services.crawler.hybrid_router import hybrid_router
 from app.services.crawler.vision_fetcher import shopping_vision_has_signal, vision_extract_shopping, vision_fallback_enabled
 from app.services.matching.product_matcher import ProductMatcher
@@ -43,7 +43,9 @@ async def _extract_with_llm(crawl: dict, query: str, retailer_key: str) -> dict:
     excerpt = crawl.get("price_html_excerpt") or ""
     if not html and excerpt:
         html = excerpt
-    fields = extract_product_fields(html, page_text)
+    fields = extract_product_fields_with_heal(
+        html, page_text, retailer_key=retailer_key, persist_heal=True
+    )
     llm_context, candidates = prepare_llm_context(page_text, html, query, retailer_key)
     pre_candidates = crawl.get("price_candidates_usd") or []
     if pre_candidates:

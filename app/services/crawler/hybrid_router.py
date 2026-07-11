@@ -70,9 +70,19 @@ class HybridRouter:
             esc, esc_reason = _compliance.should_escalate_after_response(
                 text, result.get("http_status"), result.get("tier_used", 1), result.get("url", url)
             )
+            # AnyCrawl-style ``auto``: escalate when HTML is an SPA shell / JS-needed,
+            # not only when an anti-bot block is detected.
+            if not esc and source.escalate_on_block and settings.enable_auto_js_probe:
+                from app.services.crawler.js_probe import needs_js_rendering
+
+                needs_js, js_reason = needs_js_rendering(result.get("html"), text)
+                if needs_js:
+                    esc, esc_reason = True, f"js_probe:{js_reason}"
+
             if esc and source.escalate_on_block:
                 logger.info("Escalating %s to managed fetch: %s", url, esc_reason)
-                _registry.log_event(db, source.id, "captcha_detected", url, result.get("http_status"), esc_reason)
+                event = "captcha_detected" if "js_probe" not in esc_reason else "js_escalate"
+                _registry.log_event(db, source.id, event, url, result.get("http_status"), esc_reason)
                 escalated_from = esc_reason
                 result = await fetch_managed(url, retailer_key=source.retailer_key or "")
 

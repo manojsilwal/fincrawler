@@ -138,5 +138,18 @@ class Settings:
             os.getenv("BROWSER_GRID_WORKER_CONCURRENCY", "2")
         )
 
+        # Crawl job queue (async scrape / scoped PDP crawl)
+        self.crawl_jobs_queue_key = os.getenv(
+            "CRAWL_JOBS_QUEUE_KEY", "fincrawler:crawl_jobs:jobs"
+        )
+        self.enable_auto_js_probe = (
+            os.getenv("ENABLE_AUTO_JS_PROBE", "true").lower() == "true"
+        )
+        self.crawl_cache_backend = os.getenv("CRAWL_CACHE_BACKEND", "auto")  # auto|memory|redis
+        self.crawl_cache_default_max_age_ms = int(
+            os.getenv("CRAWL_CACHE_DEFAULT_MAX_AGE_MS", "600000")
+        )
+        self.llm_max_concurrency = int(os.getenv("LLM_MAX_CONCURRENCY", "2"))
+
         self.log_level = os.getenv("LOG_LEVEL", "INFO")
         self.snapshot_dir = os.getenv("SNAPSHOT_DIR", "data/snapshots")

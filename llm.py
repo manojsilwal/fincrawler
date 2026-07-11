@@ -31,7 +31,14 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Provider cascade — NVIDIA → OpenRouter → GitHub Models → Gemini
 # ---------------------------------------------------------------------------
-_llm_semaphore = asyncio.Semaphore(1)
+def _llm_concurrency() -> int:
+    try:
+        return max(1, int(os.getenv("LLM_MAX_CONCURRENCY", "2")))
+    except ValueError:
+        return 2
+
+
+_llm_semaphore = asyncio.Semaphore(_llm_concurrency())
 _clients: dict[str, AsyncOpenAI] = {}
 
 
@@ -86,15 +93,27 @@ def _gemini_key() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Constants
+# Constants — env names aligned with TradeTalk ``backend/llm_client.py``
 # ---------------------------------------------------------------------------
 _DEFAULT_MODEL = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
-_MODEL = os.getenv("LLM_MODEL", _DEFAULT_MODEL)
-# Same-provider retry model (OpenRouter); provider fallback uses NVIDIA vars below.
-_FALLBACK_MODEL = os.getenv("LLM_FALLBACK_MODEL", _DEFAULT_MODEL)
-_FALLBACK_PROVIDER_MODEL = os.getenv("LLM_FALLBACK_PROVIDER_MODEL", "minimaxai/minimax-m3")
-_FALLBACK_VISION_MODEL = os.getenv(
-    "LLM_FALLBACK_VISION_MODEL", _FALLBACK_PROVIDER_MODEL
+# OpenRouter model: OPENROUTER_MODEL (TradeTalk) or LLM_MODEL (FinCrawler legacy)
+_MODEL = (
+    os.getenv("OPENROUTER_MODEL", "").strip()
+    or os.getenv("LLM_MODEL", "").strip()
+    or _DEFAULT_MODEL
+)
+# Same-provider retry model (OpenRouter)
+_FALLBACK_MODEL = os.getenv("LLM_FALLBACK_MODEL", _MODEL)
+# NVIDIA model: NVIDIA_MODEL (TradeTalk) or LLM_FALLBACK_PROVIDER_MODEL
+_FALLBACK_PROVIDER_MODEL = (
+    os.getenv("NVIDIA_MODEL", "").strip()
+    or os.getenv("LLM_FALLBACK_PROVIDER_MODEL", "").strip()
+    or "minimaxai/minimax-m3"
+)
+_FALLBACK_VISION_MODEL = (
+    os.getenv("LLM_FALLBACK_VISION_MODEL", "").strip()
+    or os.getenv("NVIDIA_MODEL", "").strip()
+    or _FALLBACK_PROVIDER_MODEL
 )
 _FALLBACK_MAX_TOKENS = int(os.getenv("LLM_FALLBACK_MAX_TOKENS", "8192"))
 _MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "16384"))
@@ -111,34 +130,64 @@ _GEMINI_BASE_URL = os.getenv(
 _GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
 
 
+def _gemini_fallback_enabled() -> bool:
+    """Match TradeTalk ``gemini_llm_fallback_enabled`` (default on when key present)."""
+    flag = os.getenv("GEMINI_LLM_FALLBACK", "1").strip().lower()
+    return flag not in ("0", "false", "no", "off")
+
+
+def _nvidia_base_url() -> str:
+    return (
+        os.getenv("NVIDIA_BASE_URL", "").strip()
+        or os.getenv("LLM_FALLBACK_BASE_URL", "").strip()
+        or "https://integrate.api.nvidia.com/v1"
+    )
+
+
 def _ordered_providers(*, vision: bool = False) -> list[_Provider]:
     """
-    Build the try-order matching TradeTalk LLMClient:
-    NVIDIA → OpenRouter → GitHub Models → Gemini.
+    Build the try-order matching TradeTalk LLMClient HTTP cascade:
+      NVIDIA → OpenRouter → GitHub Models → Gemini (if GEMINI_LLM_FALLBACK).
+
+    ``LLM_HTTP_PROVIDER=github`` puts GitHub first (same as TradeTalk).
     """
     providers: list[_Provider] = []
+    preferred = os.getenv("LLM_HTTP_PROVIDER", "").strip().lower()
 
-    nv_key = _nvidia_key()
-    if nv_key:
-        base = os.getenv(
-            "LLM_FALLBACK_BASE_URL", "https://integrate.api.nvidia.com/v1"
-        ).strip()
-        model = _FALLBACK_VISION_MODEL if vision else _FALLBACK_PROVIDER_MODEL
+    def _add_nvidia() -> None:
+        nv_key = _nvidia_key()
+        if not nv_key:
+            return
+        nvidia_model = (
+            os.getenv("NVIDIA_MODEL", "").strip()
+            or os.getenv("LLM_FALLBACK_PROVIDER_MODEL", "").strip()
+            or _FALLBACK_PROVIDER_MODEL
+        )
+        vision_model = (
+            os.getenv("LLM_FALLBACK_VISION_MODEL", "").strip()
+            or nvidia_model
+        )
+        model = vision_model if vision else nvidia_model
         providers.append(
             _Provider(
                 "nvidia",
-                _client_for("nvidia", nv_key, base),
+                _client_for("nvidia", nv_key, _nvidia_base_url()),
                 model,
                 _FALLBACK_MAX_TOKENS,
             )
         )
 
-    or_key = _openrouter_key()
-    if or_key:
+    def _add_openrouter() -> None:
+        or_key = _openrouter_key()
+        if not or_key:
+            return
         base = os.getenv("LLM_BASE_URL", "https://openrouter.ai/api/v1")
-        model = (
-            (_resolve_vision_model() if vision else _MODEL)
+        or_model = (
+            os.getenv("OPENROUTER_MODEL", "").strip()
+            or os.getenv("LLM_MODEL", "").strip()
+            or _MODEL
         )
+        model = _resolve_vision_model() if vision else or_model
         providers.append(
             _Provider(
                 "openrouter",
@@ -148,8 +197,10 @@ def _ordered_providers(*, vision: bool = False) -> list[_Provider]:
             )
         )
 
-    gh_key = _github_key()
-    if gh_key:
+    def _add_github() -> None:
+        gh_key = _github_key()
+        if not gh_key:
+            return
         providers.append(
             _Provider(
                 "github",
@@ -159,8 +210,12 @@ def _ordered_providers(*, vision: bool = False) -> list[_Provider]:
             )
         )
 
-    gem_key = _gemini_key()
-    if gem_key:
+    def _add_gemini() -> None:
+        if not _gemini_fallback_enabled():
+            return
+        gem_key = _gemini_key()
+        if not gem_key:
+            return
         providers.append(
             _Provider(
                 "gemini",
@@ -170,6 +225,17 @@ def _ordered_providers(*, vision: bool = False) -> list[_Provider]:
             )
         )
 
+    if preferred == "github":
+        _add_github()
+        _add_nvidia()
+        _add_openrouter()
+    else:
+        _add_nvidia()
+        _add_openrouter()
+        _add_github()
+
+    # Gemini last (TradeTalk: after HTTP cascade when GEMINI_LLM_FALLBACK enabled)
+    _add_gemini()
     return providers
 
 
@@ -198,11 +264,15 @@ def _get_client() -> AsyncOpenAI:
 
 
 def _should_use_nvidia_fallback(exc: BaseException) -> bool:
-    """True when a provider error should trigger cascade to the next provider."""
+    """True when a provider error should trigger cascade to the next provider.
+
+    Matches TradeTalk cascade behavior: rate limits, auth/billing, and provider
+    outages (including NVIDIA 400 DEGRADED function) move to the next slot.
+    """
     if isinstance(exc, RateLimitError):
         return True
     if isinstance(exc, APIStatusError):
-        return exc.status_code in (401, 402, 403, 429, 500, 502, 503)
+        return exc.status_code in (400, 401, 402, 403, 408, 429, 500, 502, 503, 529)
     msg = str(exc).lower()
     return any(
         token in msg
@@ -216,6 +286,8 @@ def _should_use_nvidia_fallback(exc: BaseException) -> bool:
             "unauthorized",
             "forbidden",
             "temporarily unavailable",
+            "degraded",
+            "cannot be invoked",
         )
     )
 

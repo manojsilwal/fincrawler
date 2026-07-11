@@ -128,3 +128,43 @@ def extract_product_fields(html: str, page_text: str = "") -> dict[str, Any]:
         "rating": rating,
         "review_count": review_count,
     }
+
+
+def extract_product_fields_with_heal(
+    html: str,
+    page_text: str = "",
+    *,
+    retailer_key: str = "",
+    persist_heal: bool = True,
+) -> dict[str, Any]:
+    """JSON-LD/CSS extract; on failure try profile selectors then self-heal."""
+    fields = extract_product_fields(html, page_text)
+    if not fields.get("_error"):
+        return fields
+
+    if retailer_key:
+        from app.services.crawler.selector_healer import (
+            extract_with_profile_selectors,
+            heal_retailer_selectors,
+        )
+
+        healed_fields = extract_with_profile_selectors(html, retailer_key)
+        if healed_fields.get("title"):
+            fields = {**fields, **healed_fields}
+            fields.pop("_error", None)
+            fields["_healed"] = True
+            return fields
+
+        suggestions = heal_retailer_selectors(
+            retailer_key, html, persist=persist_heal
+        )
+        retry = extract_with_profile_selectors(html, retailer_key)
+        if retry.get("title"):
+            fields = {**fields, **retry}
+            fields.pop("_error", None)
+            fields["_healed"] = True
+            fields["_heal_suggestions"] = suggestions
+            return fields
+        fields["_heal_suggestions"] = suggestions
+
+    return fields

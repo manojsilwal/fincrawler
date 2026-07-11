@@ -64,6 +64,29 @@ class CrawlJobUrlRequest(BaseModel):
     url: str
 
 
+class CrawlJobEnqueueRequest(BaseModel):
+    url: str
+    job_type: str = Field(default="scrape")
+    source_id: Optional[uuid.UUID] = None
+    retailer_key: Optional[str] = None
+    max_depth: int = Field(default=2, ge=0, le=4)
+    limit: int = Field(default=20, ge=1, le=50)
+    include_paths: Optional[list[str]] = None
+    exclude_paths: Optional[list[str]] = None
+    strategy: str = Field(default="same-domain")
+
+
+class ScopedPdpCrawlRequest(BaseModel):
+    url: str
+    max_depth: int = Field(default=2, ge=0, le=4)
+    limit: int = Field(default=20, ge=1, le=50)
+    include_paths: Optional[list[str]] = None
+    exclude_paths: Optional[list[str]] = None
+    strategy: str = Field(default="same-domain")
+    retailer_key: Optional[str] = None
+    async_job: bool = False
+
+
 class ShopSearchRequest(BaseModel):
     query: str
     retailers: Optional[list[str]] = None
